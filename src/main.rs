@@ -4,6 +4,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::RwLock,
+    time::{sleep, Duration},
 };
 
 #[tokio::main]
@@ -31,8 +32,7 @@ async fn handle_stream(
         if read_count == 0 {
             break Ok(());
         }
-        let mut command = parse_resp(&buf)?;
-        command[0] = command[0].to_lowercase();
+        let command = parse_resp(&buf)?;
         match command
             .iter()
             .map(String::as_str)
@@ -49,13 +49,31 @@ async fn handle_stream(
             }
             ["set", key, value] => {
                 let mut map = shared_map.write().await;
-                map.insert(key.to_string(), value.to_string());
+                let k = key.to_string();
+                map.insert(k, value.to_string());
+
+                stream.write_all(b"+OK\r\n").await?;
+            }
+            ["set", key, value, "px", ttl] => {
+                let mut map = shared_map.write().await;
+                let k = key.to_string();
+                map.insert(k, value.to_string());
+                let ttl: u64 = ttl.parse()?;
+                let clone_map = shared_map.clone();
+                let k_clone = key.to_string();
+                tokio::spawn(async move {
+                    sleep(Duration::from_millis(ttl)).await;
+                    let mut map = clone_map.write().await;
+                    map.remove(&k_clone);
+                });
                 stream.write_all(b"+OK\r\n").await?;
             }
             ["get", key] => {
                 let map = shared_map.read().await;
-                let default = String::from("");
-                let value = map.get(key.to_owned()).unwrap_or(&default);
+                let Some(value) = map.get(key.to_owned()) else {
+                    stream.write_all(b"$-1\r\n").await?;
+                    return Ok(());
+                };
                 stream
                     .write_all(format!("+{}\r\n", value).as_bytes())
                     .await?;
@@ -78,7 +96,7 @@ fn parse_resp(buf: &[u8]) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
         let _bulk_len: usize = bulk_len_line[1..].parse()?;
 
         let bulk_str = lines.next().ok_or("bulk string line is empty")?;
-        command.push(bulk_str.to_owned());
+        command.push(bulk_str.to_lowercase());
     }
 
     Ok(command)
