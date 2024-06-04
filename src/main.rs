@@ -1,4 +1,5 @@
 // Uncomment this block to pass the first stage
+use std::env;
 use std::{collections::HashMap, error::Error, str, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -12,9 +13,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
     // Uncomment this block to pass the first stage
-    //
+    let args: Vec<String> = env::args().collect();
+    let address = match args
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<&str>>()
+        .as_slice()
+    {
+        [_, "--port", port] => port,
+        _ => "6379",
+    };
     let shared_map = Arc::new(RwLock::new(HashMap::new()));
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", address))
+        .await
+        .unwrap();
     loop {
         let (stream, _) = listener.accept().await?;
         let map_clone = Arc::clone(&shared_map);
