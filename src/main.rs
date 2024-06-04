@@ -51,6 +51,10 @@ async fn handle_stream(
             .collect::<Vec<&str>>()
             .as_slice()
         {
+            ["info", _] => {
+                let response = to_redis_bulk_string("role:master");
+                stream.write_all(response.as_bytes()).await?;
+            }
             ["ping"] => {
                 stream.write_all(b"+PONG\r\n").await?;
             }
@@ -112,4 +116,9 @@ fn parse_resp(buf: &[u8]) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     }
 
     Ok(command)
+}
+
+fn to_redis_bulk_string(input: &str) -> String {
+    let length = input.len();
+    format!("${}\r\n{}\r\n", length, input)
 }
