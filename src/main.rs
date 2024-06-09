@@ -1,13 +1,12 @@
 // Uncomment this block to pass the first stage
+use chrono::Utc;
 use std::env;
 use std::{collections::HashMap, error::Error, str, sync::Arc};
 use tokio::sync::RwLock;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    time::{sleep, Duration},
 };
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -45,17 +44,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 async fn handle_stream(
     mut stream: tokio::net::TcpStream,
-    shared_map: Arc<RwLock<HashMap<String, String>>>,
+    shared_map: Arc<RwLock<HashMap<String, Value>>>,
     config: Arc<RwLock<HashMap<&str, String>>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = [0; 512];
+    let req_time = Utc::now().timestamp_millis();
     loop {
         let read_count = stream.read(&mut buf).await?;
         if read_count == 0 {
             break Ok(());
         }
         let command = parse_resp(&buf)?;
-        if command.iter().any(|s| s == "info") {
+
+        if command.contains(&String::from("info")) {
             let role = config.read().await;
             let role = match role.get("replica_of_host") {
                 Some(_) => "slave",
@@ -63,68 +64,71 @@ async fn handle_stream(
             };
             let response = to_redis_bulk_string(format!("role:{}", role).as_str());
             stream.write_all(response.as_bytes()).await?;
-        }
-
-        if command.iter().any(|s| s == "ping") {
+        } else if command.contains(&String::from("ping")) {
             stream.write_all(b"+PONG\r\n").await?;
-            return Ok(());
-        }
-
-        if command.iter().any(|s| s == "echo") {
+        } else if command.contains(&String::from("echo")) {
             let default = String::from("");
             let message = command.get(1).unwrap_or(&default);
             stream
                 .write_all(format!("+{}\r\n", message).as_bytes())
                 .await?;
-            return Ok(());
-        }
-
-        if command.iter().any(|s| s == "set") {
+        } else if command.contains(&String::from("set")) {
+            println!("==========in set============");
             let default = String::from("");
             let Some(key) = command.get(1) else {
                 stream.write_all(b"-ERR no key provided\r\n").await?;
-                return Ok(());
+                continue;
             };
             let value = command.get(2).unwrap_or(&default);
-            let mut map = shared_map.write().await;
             let k = key.to_string();
-            map.insert(k, value.to_string());
-            let Some(px_index) = command.iter().position(|s| s == "px") else {
-                stream.write_all(b"+OK\r\n").await?;
-                return Ok(());
-            };
-            let ttl: u64 = command
-                .get(px_index + 1)
-                .unwrap_or(&String::from("0"))
-                .parse::<u64>()?;
-            if ttl > 0 {
-                let clone_map = shared_map.clone();
-                let k_clone = key.to_string();
-                tokio::spawn(async move {
-                    sleep(Duration::from_millis(ttl)).await;
-                    let mut map = clone_map.write().await;
-                    map.remove(&k_clone);
-                });
+            let mut ttl: i64 = 0;
+            if let Some(px_index) = command.iter().position(|s| s.to_lowercase() == "px") {
+                let _ttl = command.get(px_index + 1);
+                if _ttl.is_none() {
+                    stream.write_all(b"-no ttl provided\r\n").await?;
+                    return Ok(());
+                }
+                let _ttl = _ttl.unwrap().parse::<i64>();
+                if _ttl.is_err() {
+                    stream.write_all(b"-ttl not valid u64\r\n").await?;
+                    return Ok(());
+                }
+                ttl = _ttl.unwrap();
             }
+            let v = Value {
+                value: value.to_owned(),
+                created_at: req_time,
+                ttl,
+            };
+            let mut map = shared_map.write().await;
+            map.insert(k, v);
+            drop(map);
             stream.write_all(b"+OK\r\n").await?;
-            return Ok(());
-        }
-        if command.iter().any(|s| s == "get") {
+        } else if command.contains(&String::from("get")) {
             let map = shared_map.read().await;
             let Some(key) = command.get(1) else {
                 stream.write_all(b"-ERR no key provided\r\n").await?;
-                return Ok(());
+                continue;
             };
             let Some(value) = map.get(key) else {
+                drop(map);
                 stream.write_all(b"$-1\r\n").await?;
-                return Ok(());
+                continue;
             };
+            if value.ttl != 0 && Utc::now().timestamp_millis() - value.created_at >= value.ttl {
+                drop(map);
+                let mut map = shared_map.write().await;
+                map.remove(key);
+                drop(map);
+                stream.write_all(b"$-1\r\n").await?;
+                continue;
+            }
             stream
-                .write_all(format!("+{}\r\n", value).as_bytes())
+                .write_all(format!("+{}\r\n", value.value).as_bytes())
                 .await?;
-            return Ok(());
+        } else {
+            stream.write_all(b"-ERR unknown command\r\n").await?;
         }
-        stream.write_all(b"-ERR unknown command\r\n").await?;
     }
 }
 
@@ -150,4 +154,10 @@ fn parse_resp(buf: &[u8]) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
 fn to_redis_bulk_string(input: &str) -> String {
     let length = input.len();
     format!("${}\r\n{}\r\n", length, input)
+}
+
+struct Value {
+    value: String,
+    created_at: i64,
+    ttl: i64,
 }
