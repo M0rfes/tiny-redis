@@ -36,7 +36,41 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let master_port = config.get("master_port").unwrap();
         let address = format!("{master_host}:{master_port}");
         let mut socket = TcpStream::connect(address).await?;
-        socket.write(b"*1\r\n$4\r\nPING\r\n").await?;
+        socket.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
+        let mut buf = [0; 1024];
+        let n = socket.read(&mut buf).await?;
+        let response = String::from_utf8_lossy(&buf[..n]);
+        if response.trim() != "+PONG" {
+            panic!("wanted pong got:{response}");
+        }
+        let port = config.get("port").unwrap();
+
+        socket
+            .write_all(
+                format!(
+                    "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n{}\r\n",
+                    port
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut buf = [0; 1024];
+        let n = socket.read(&mut buf).await?;
+        let response = String::from_utf8_lossy(&buf[..n]);
+        if response.trim() != "+OK" {
+            panic!("wanted OK got:{response}");
+        }
+        socket
+            .write_all(
+                format!("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n",).as_bytes(),
+            )
+            .await?;
+        let mut buf = [0; 1024];
+        let n = socket.read(&mut buf).await?;
+        let response = String::from_utf8_lossy(&buf[..n]);
+        if response.trim() != "+OK" {
+            panic!("wanted OK got:{response}");
+        }
     }
     let config = Arc::new(RwLock::new(config));
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
@@ -152,6 +186,9 @@ async fn handle_stream(
             stream
                 .write_all(format!("+{}\r\n", value.value).as_bytes())
                 .await?;
+        } else if command.contains(&String::from("replconf")) {
+            // todo!
+            stream.write_all(b"+OK\r\n").await?;
         } else {
             stream.write_all(b"-ERR unknown command\r\n").await?;
         }
