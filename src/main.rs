@@ -2,11 +2,13 @@
 use chrono::Utc;
 use std::env;
 use std::{collections::HashMap, error::Error, str, sync::Arc};
+use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -27,18 +29,36 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .expect("no master info provided")
             .split(" ")
             .collect::<Vec<&str>>();
-        config.insert("replica_of_host", replica_of[0].to_owned());
-        config.insert("replica_of_port", replica_of[1].to_owned());
+        config.insert("master_host", replica_of[0].to_owned());
+        config.insert("master_port", replica_of[1].to_owned());
+    }
+    if let Some(master_host) = config.get("master_host") {
+        let master_port = config.get("master_port").unwrap();
+        let address = format!("{master_host}:{master_port}");
+        let mut socket = TcpStream::connect(address).await?;
+        socket.write(b"*1\r\n$4\r\nPING\r\n").await?;
     }
     let config = Arc::new(RwLock::new(config));
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     loop {
         let (stream, _) = listener.accept().await?;
         let map_clone = Arc::clone(&shared_map);
         let config_clone = Arc::clone(&config);
         tokio::spawn(handle_stream(stream, map_clone, config_clone));
+    }
+}
+
+enum Role {
+    Master,
+    Slave,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::Master => write!(f, "master"),
+            Role::Slave => write!(f, "slave"),
+        }
     }
 }
 
@@ -49,6 +69,11 @@ async fn handle_stream(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = [0; 512];
     let req_time = Utc::now().timestamp_millis();
+    let role = config.read().await;
+    let role = match role.get("master_host") {
+        Some(_) => Role::Slave,
+        None => Role::Master,
+    };
     loop {
         let read_count = stream.read(&mut buf).await?;
         if read_count == 0 {
@@ -57,11 +82,6 @@ async fn handle_stream(
         let command = parse_resp(&buf)?;
 
         if command.contains(&String::from("info")) {
-            let role = config.read().await;
-            let role = match role.get("replica_of_host") {
-                Some(_) => "slave",
-                None => "master",
-            };
             let mut response = to_redis_bulk_string(format!("role:{}", role).as_str());
             // master_replid: 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb
             response = to_redis_bulk_string(
