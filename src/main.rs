@@ -62,7 +62,14 @@ async fn handle_stream(
                 Some(_) => "slave",
                 None => "master",
             };
-            let response = to_redis_bulk_string(format!("role:{}", role).as_str());
+            let mut response = to_redis_bulk_string(format!("role:{}", role).as_str());
+            // master_replid: 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb
+            response = to_redis_bulk_string(
+                format!("{response}master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb")
+                    .as_str(),
+            );
+            // master_repl_offset: 0
+            response = to_redis_bulk_string(format!("{response}master_repl_offset:0").as_str());
             stream.write_all(response.as_bytes()).await?;
         } else if command.contains(&String::from("ping")) {
             stream.write_all(b"+PONG\r\n").await?;
@@ -73,7 +80,6 @@ async fn handle_stream(
                 .write_all(format!("+{}\r\n", message).as_bytes())
                 .await?;
         } else if command.contains(&String::from("set")) {
-            println!("==========in set============");
             let default = String::from("");
             let Some(key) = command.get(1) else {
                 stream.write_all(b"-ERR no key provided\r\n").await?;
