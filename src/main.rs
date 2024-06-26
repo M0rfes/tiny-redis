@@ -71,6 +71,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         if response.trim() != "+OK" {
             panic!("wanted OK got:{response}");
         }
+        socket
+            .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+            .await?;
+        let mut buf = [0; 1024];
+        let _n = socket.read(&mut buf).await?;
     }
     let config = Arc::new(RwLock::new(config));
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
