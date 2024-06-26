@@ -118,7 +118,7 @@ async fn handle_stream(
         if read_count == 0 {
             break Ok(());
         }
-        let command = parse_resp(&buf)?;
+        let mut command = parse_resp(&buf)?;
 
         if command.contains(&String::from("info")) {
             let mut response = to_redis_bulk_string(format!("role:{}", role).as_str());
@@ -194,6 +194,21 @@ async fn handle_stream(
         } else if command.contains(&String::from("replconf")) {
             // todo!
             stream.write_all(b"+OK\r\n").await?;
+        } else if command.contains(&String::from("psync")) {
+            let Some(replication_id) = command.get_mut(1) else {
+                stream.write_all(b"-ERR no replication id provided").await?;
+                return Ok(());
+            };
+            if replication_id == "?" {
+                replication_id.clear();
+                replication_id.push_str("abc")
+            }
+            stream
+                .write_all(
+                    to_redis_bulk_string(format!("FULLRESYNC {} 0", replication_id).as_str())
+                        .as_bytes(),
+                )
+                .await?
         } else {
             stream.write_all(b"-ERR unknown command\r\n").await?;
         }
