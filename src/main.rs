@@ -275,7 +275,7 @@ struct Value {
 
 async fn propagate(port: String, message: String) -> Result<(), Box<dyn Error + Send + Sync>> {
     sleep(Duration::from_millis(2)).await;
-    let address = format!("127.0.0.1:{}", port);
+    let address = format!(":{}", port);
     println!("sending to {address}");
     let mut slave_socket = TcpStream::connect(address).await?;
     slave_socket.write_all(message.as_bytes()).await?;
