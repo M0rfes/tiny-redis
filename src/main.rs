@@ -107,6 +107,7 @@ async fn handle_stream(
         Some(_) => Role::Slave,
         None => Role::Master,
     };
+    let mut sets: Vec<String> = vec![];
     loop {
         let read_count = stream.read(&mut buf).await?;
         if read_count == 0 {
@@ -133,12 +134,6 @@ async fn handle_stream(
                 .write_all(format!("+{}\r\n", message).as_bytes())
                 .await?;
         } else if command.contains(&String::from("set")) {
-            match role {
-                Role::Slave => {
-                    println!("salve recived value {}", command.join(" "));
-                }
-                _ => (),
-            }
             let default = String::from("");
             let Some(key) = command.get(1) else {
                 stream.write_all(b"-ERR no key provided\r\n").await?;
@@ -174,10 +169,14 @@ async fn handle_stream(
                 continue;
             };
             let message = format_as_resp_array(command[..3].to_vec());
-
+            sets.push(message);
             match role {
                 Role::Master => {
-                    tokio::spawn(propagate(port.to_owned(), message));
+                    if sets.len() == 3 {
+                        for msg in sets.as_slice() {
+                            tokio::spawn(propagate(port.to_owned(), msg.to_owned()));
+                        }
+                    }
                 }
                 _ => (),
             };
@@ -233,7 +232,6 @@ async fn handle_stream(
                 .write(format!("${}\r\n", empty_file_payload.len()).as_bytes())
                 .await?;
             stream.write(empty_file_payload.as_slice()).await?;
-            propagate("6380".into(), "hello".into()).await?;
         } else {
             stream.write_all(b"-ERR unknown command\r\n").await?;
         }
