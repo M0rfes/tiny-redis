@@ -233,6 +233,7 @@ async fn handle_stream(
                 .write(format!("${}\r\n", empty_file_payload.len()).as_bytes())
                 .await?;
             stream.write(empty_file_payload.as_slice()).await?;
+            propagate("6380".into(), "hello".into()).await?;
         } else {
             stream.write_all(b"-ERR unknown command\r\n").await?;
         }
@@ -281,6 +282,6 @@ async fn propagate(port: String, message: String) -> Result<(), Box<dyn Error + 
     let address = format!("127.0.0.1:{}", port);
     println!("sending to {address}");
     let mut slave_socket = TcpStream::connect(address).await?;
-    slave_socket.write_all(b"+hello").await?;
+    slave_socket.write_all(message.as_bytes()).await?;
     Ok(())
 }
