@@ -1,8 +1,7 @@
 // Uncomment this block to pass the first stage
 use chrono::Utc;
-use hex::decode;
+use std::env;
 use std::{collections::HashMap, error::Error, str, sync::Arc};
-use std::{env, fs};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::{
@@ -25,13 +24,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     config.insert("port", port.to_owned());
     if let Some(replica_of_index) = args.iter().position(|s| s == "--replicaof") {
-        let replica_of = args
-            .get(replica_of_index + 1)
-            .expect("no master info provided")
-            .split(" ")
-            .collect::<Vec<&str>>();
-        config.insert("master_host", replica_of[0].to_owned());
-        config.insert("master_port", replica_of[1].to_owned());
+        config.insert("master_host", args[replica_of_index + 1].to_owned());
+        config.insert("master_port", args[replica_of_index + 2].to_owned());
     }
     if let Some(master_host) = config.get("master_host") {
         let master_port = config.get("master_port").unwrap();
@@ -109,8 +103,7 @@ async fn handle_stream(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = [0; 512];
     let req_time = Utc::now().timestamp_millis();
-    let role = config.read().await;
-    let role = match role.get("master_host") {
+    let role = match config.read().await.get("master_host") {
         Some(_) => Role::Slave,
         None => Role::Master,
     };
@@ -140,6 +133,12 @@ async fn handle_stream(
                 .write_all(format!("+{}\r\n", message).as_bytes())
                 .await?;
         } else if command.contains(&String::from("set")) {
+            match role {
+                Role::Slave => {
+                    println!("salve recived value {}", command.join(" "));
+                }
+                _ => (),
+            }
             let default = String::from("");
             let Some(key) = command.get(1) else {
                 stream.write_all(b"-ERR no key provided\r\n").await?;
@@ -152,12 +151,12 @@ async fn handle_stream(
                 let _ttl = command.get(px_index + 1);
                 if _ttl.is_none() {
                     stream.write_all(b"-no ttl provided\r\n").await?;
-                    return Ok(());
+                    continue;
                 }
                 let _ttl = _ttl.unwrap().parse::<i64>();
                 if _ttl.is_err() {
                     stream.write_all(b"-ttl not valid u64\r\n").await?;
-                    return Ok(());
+                    continue;
                 }
                 ttl = _ttl.unwrap();
             }
@@ -170,6 +169,18 @@ async fn handle_stream(
             map.insert(k, v);
             drop(map);
             stream.write_all(b"+OK\r\n").await?;
+            let config = config.read().await;
+            let Some(port) = config.get("slave_port") else {
+                continue;
+            };
+            let message = format_as_resp_array(command[..3].to_vec());
+
+            match role {
+                Role::Master => {
+                    tokio::spawn(propagate(port.to_owned(), message));
+                }
+                _ => (),
+            };
         } else if command.contains(&String::from("get")) {
             let map = shared_map.read().await;
             let Some(key) = command.get(1) else {
@@ -193,12 +204,19 @@ async fn handle_stream(
                 .write_all(format!("+{}\r\n", value.value).as_bytes())
                 .await?;
         } else if command.contains(&String::from("replconf")) {
-            // todo!
+            if command.contains(&String::from("listening-port")) {
+                let Some(port) = command.get(2) else {
+                    stream.write_all(b"-No port provided\r\n").await?;
+                    continue;
+                };
+                let mut config = config.write().await;
+                config.insert("slave_port", port.to_owned());
+            }
             stream.write_all(b"+OK\r\n").await?;
         } else if command.contains(&String::from("psync")) {
             let Some(replication_id) = command.get_mut(1) else {
                 stream.write_all(b"-ERR no replication id provided").await?;
-                return Ok(());
+                continue;
             };
             if replication_id == "?" {
                 replication_id.clear();
@@ -245,8 +263,24 @@ fn to_redis_bulk_string(input: &str) -> String {
     format!("${}\r\n{}\r\n", length, input)
 }
 
+fn format_as_resp_array(vec: Vec<String>) -> String {
+    let mut resp_string = format!("*{}\r\n", vec.len());
+    for element in vec {
+        resp_string.push_str(&format!("${}\r\n{}\r\n", element.len(), element));
+    }
+    resp_string
+}
+
 struct Value {
     value: String,
     created_at: i64,
     ttl: i64,
+}
+
+async fn propagate(port: String, message: String) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let address = format!("127.0.0.1:{}", port);
+    println!("sending to {address}");
+    let mut slave_socket = TcpStream::connect(address).await?;
+    slave_socket.write_all(b"+hello").await?;
+    Ok(())
 }
