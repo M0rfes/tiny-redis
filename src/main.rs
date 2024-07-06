@@ -26,8 +26,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     config.insert("port", port.to_owned());
     if let Some(replica_of_index) = args.iter().position(|s| s == "--replicaof") {
-        config.insert("master_host", args[replica_of_index + 1].to_owned());
-        config.insert("master_port", args[replica_of_index + 2].to_owned());
+        let replica: Vec<&str> = args.get(replica_of_index + 1).unwrap().split(" ").collect();
+        config.insert("master_host", replica[0].to_owned());
+        config.insert("master_port", replica[1].to_owned());
     }
     if let Some(master_host) = config.get("master_host") {
         let master_port = config.get("master_port").unwrap();
