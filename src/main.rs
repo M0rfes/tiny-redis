@@ -107,7 +107,6 @@ async fn handle_stream(
         Some(_) => Role::Slave,
         None => Role::Master,
     };
-    let mut sets: Vec<String> = vec![];
     loop {
         let read_count = stream.read(&mut buf).await?;
         if read_count == 0 {
@@ -169,14 +168,10 @@ async fn handle_stream(
                 continue;
             };
             let message = format_as_resp_array(command[..3].to_vec());
-            sets.push(message);
+
             match role {
                 Role::Master => {
-                    if sets.len() == 3 {
-                        for msg in sets.as_slice() {
-                            tokio::spawn(propagate(port.to_owned(), msg.to_owned()));
-                        }
-                    }
+                    tokio::spawn(propagate(port.to_owned(), message));
                 }
                 _ => (),
             };
@@ -227,11 +222,12 @@ async fn handle_stream(
                         .as_bytes(),
                 )
                 .await?;
-            let empty_file_payload = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2")?;
+            // let empty_file_payload = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2")?;
+            let empty_file_payload = "";
             stream
                 .write(format!("${}\r\n", empty_file_payload.len()).as_bytes())
                 .await?;
-            stream.write(empty_file_payload.as_slice()).await?;
+            stream.write(empty_file_payload.as_bytes()).await?;
         } else {
             stream.write_all(b"-ERR unknown command\r\n").await?;
         }
