@@ -1,9 +1,11 @@
 // Uncomment this block to pass the first stage
 use chrono::Utc;
 use std::env;
+use std::time::Duration;
 use std::{collections::HashMap, error::Error, str, sync::Arc};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -272,6 +274,7 @@ struct Value {
 }
 
 async fn propagate(port: String, message: String) -> Result<(), Box<dyn Error + Send + Sync>> {
+    sleep(Duration::from_millis(2)).await;
     let address = format!("127.0.0.1:{}", port);
     println!("sending to {address}");
     let mut slave_socket = TcpStream::connect(address).await?;
