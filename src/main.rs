@@ -222,12 +222,11 @@ async fn handle_stream(
                         .as_bytes(),
                 )
                 .await?;
-            // let empty_file_payload = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2")?;
-            let empty_file_payload = "";
+            let empty_file_payload = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2")?;
             stream
                 .write(format!("${}\r\n", empty_file_payload.len()).as_bytes())
                 .await?;
-            stream.write(empty_file_payload.as_bytes()).await?;
+            stream.write(empty_file_payload.as_slice()).await?;
         } else {
             stream.write_all(b"-ERR unknown command\r\n").await?;
         }
