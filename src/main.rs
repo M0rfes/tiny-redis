@@ -1,11 +1,11 @@
 // Uncomment this block to pass the first stage
 use chrono::Utc;
 use std::env;
-use std::time::Duration;
 use std::{collections::HashMap, error::Error, str, sync::Arc};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
-use tokio::time::sleep;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -76,11 +76,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let config = Arc::new(RwLock::new(config));
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let (tx, mut rx) = mpsc::channel::<String>(32);
+    let tx = Arc::new(RwLock::new(tx));
+    let rx = Arc::new(RwLock::new(rx));
     loop {
         let (stream, _) = listener.accept().await?;
         let map_clone = Arc::clone(&shared_map);
         let config_clone = Arc::clone(&config);
-        tokio::spawn(handle_stream(stream, map_clone, config_clone));
+        let tx_clone = Arc::clone(&tx);
+        let rx_clone = Arc::clone(&rx);
+        tokio::spawn(handle_stream(
+            stream,
+            map_clone,
+            config_clone,
+            tx_clone,
+            rx_clone,
+        ));
     }
 }
 
@@ -102,6 +113,8 @@ async fn handle_stream(
     mut stream: tokio::net::TcpStream,
     shared_map: Arc<RwLock<HashMap<String, Value>>>,
     config: Arc<RwLock<HashMap<&str, String>>>,
+    tx: Arc<RwLock<Sender<String>>>,
+    rx: Arc<RwLock<Receiver<String>>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = [0; 512];
     let req_time = Utc::now().timestamp_millis();
@@ -173,7 +186,7 @@ async fn handle_stream(
 
             match role {
                 Role::Master => {
-                    tokio::spawn(propagate(port.to_owned(), message));
+                    tx.write().await.send(message).await?;
                 }
                 _ => (),
             };
@@ -229,6 +242,10 @@ async fn handle_stream(
                 .write(format!("${}\r\n", empty_file_payload.len()).as_bytes())
                 .await?;
             stream.write(empty_file_payload.as_slice()).await?;
+            let mut rx = rx.write().await;
+            while let Some(received) = rx.recv().await {
+                stream.write_all(received.as_bytes()).await?;
+            }
         } else {
             stream.write_all(b"-ERR unknown command\r\n").await?;
         }
@@ -271,13 +288,4 @@ struct Value {
     value: String,
     created_at: i64,
     ttl: i64,
-}
-
-async fn propagate(port: String, message: String) -> Result<(), Box<dyn Error + Send + Sync>> {
-    sleep(Duration::from_millis(2)).await;
-    let address = format!(":{}", port);
-    println!("sending to {address}");
-    let mut slave_socket = TcpStream::connect(address).await?;
-    slave_socket.write_all(message.as_bytes()).await?;
-    Ok(())
 }
