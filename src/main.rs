@@ -1,10 +1,10 @@
 // Uncomment this block to pass the first stage
 use chrono::Utc;
+use rand::Rng;
 use std::env;
 use std::{collections::HashMap, error::Error, str, sync::Arc};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::broadcast::{self, Sender};
 use tokio::sync::RwLock;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -77,22 +77,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let config = Arc::new(RwLock::new(config));
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-    let (tx, mut rx) = mpsc::channel::<String>(32);
-    let tx = Arc::new(RwLock::new(tx));
-    let rx = Arc::new(RwLock::new(rx));
+    let (tx, _) = broadcast::channel(100);
     loop {
         let (stream, _) = listener.accept().await?;
-        let map_clone = Arc::clone(&shared_map);
-        let config_clone = Arc::clone(&config);
-        let tx_clone = Arc::clone(&tx);
-        let rx_clone = Arc::clone(&rx);
-        tokio::spawn(handle_stream(
-            stream,
-            map_clone,
-            config_clone,
-            tx_clone,
-            rx_clone,
-        ));
+        let map_clone = shared_map.clone();
+        let config_clone = config.clone();
+        let tx_clone = tx.clone();
+        let stream = Arc::new(RwLock::new(stream));
+        let stream = stream.clone();
+        tokio::spawn(handle_stream(stream, map_clone, config_clone, tx_clone));
     }
 }
 
@@ -111,11 +104,10 @@ impl std::fmt::Display for Role {
 }
 
 async fn handle_stream(
-    mut stream: tokio::net::TcpStream,
+    stream: Arc<RwLock<TcpStream>>,
     shared_map: Arc<RwLock<HashMap<String, Value>>>,
     config: Arc<RwLock<HashMap<&str, String>>>,
-    tx: Arc<RwLock<Sender<String>>>,
-    rx: Arc<RwLock<Receiver<String>>>,
+    tx: Sender<String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = [0; 512];
     let req_time = Utc::now().timestamp_millis();
@@ -123,10 +115,12 @@ async fn handle_stream(
         Some(_) => Role::Slave,
         None => Role::Master,
     };
+    let mut replicas: Vec<Arc<RwLock<TcpStream>>> = vec![];
+
     loop {
-        let read_count = stream.read(&mut buf).await?;
+        let read_count = stream.write().await.read(&mut buf).await?;
         if read_count == 0 {
-            break Ok(());
+            break;
         }
         let mut command = parse_resp(&buf)?;
 
@@ -139,19 +133,25 @@ async fn handle_stream(
             );
             // master_repl_offset: 0
             response = to_redis_bulk_string(format!("{response}master_repl_offset:0").as_str());
-            stream.write_all(response.as_bytes()).await?;
+            stream.write().await.write_all(response.as_bytes()).await?;
         } else if command.contains(&String::from("ping")) {
-            stream.write_all(b"+PONG\r\n").await?;
+            stream.write().await.write_all(b"+PONG\r\n").await?;
         } else if command.contains(&String::from("echo")) {
             let default = String::from("");
             let message = command.get(1).unwrap_or(&default);
             stream
+                .write()
+                .await
                 .write_all(format!("+{}\r\n", message).as_bytes())
                 .await?;
         } else if command.contains(&String::from("set")) {
             let default = String::from("");
             let Some(key) = command.get(1) else {
-                stream.write_all(b"-ERR no key provided\r\n").await?;
+                stream
+                    .write()
+                    .await
+                    .write_all(b"-ERR no key provided\r\n")
+                    .await?;
                 continue;
             };
             let value = command.get(2).unwrap_or(&default);
@@ -160,12 +160,20 @@ async fn handle_stream(
             if let Some(px_index) = command.iter().position(|s| s.to_lowercase() == "px") {
                 let _ttl = command.get(px_index + 1);
                 if _ttl.is_none() {
-                    stream.write_all(b"-no ttl provided\r\n").await?;
+                    stream
+                        .write()
+                        .await
+                        .write_all(b"-no ttl provided\r\n")
+                        .await?;
                     continue;
                 }
                 let _ttl = _ttl.unwrap().parse::<i64>();
                 if _ttl.is_err() {
-                    stream.write_all(b"-ttl not valid u64\r\n").await?;
+                    stream
+                        .write()
+                        .await
+                        .write_all(b"-ttl not valid u64\r\n")
+                        .await?;
                     continue;
                 }
                 ttl = _ttl.unwrap();
@@ -178,28 +186,28 @@ async fn handle_stream(
             let mut map = shared_map.write().await;
             map.insert(k, v);
             drop(map);
-            stream.write_all(b"+OK\r\n").await?;
-            let config = config.read().await;
-            let Some(port) = config.get("slave_port") else {
-                continue;
-            };
+            stream.write().await.write_all(b"+OK\r\n").await?;
             let message = format_as_resp_array(command[..3].to_vec());
 
             match role {
                 Role::Master => {
-                    tx.write().await.send(message).await?;
+                    tx.send(message)?;
                 }
                 _ => (),
             };
         } else if command.contains(&String::from("get")) {
             let map = shared_map.read().await;
             let Some(key) = command.get(1) else {
-                stream.write_all(b"-ERR no key provided\r\n").await?;
+                stream
+                    .write()
+                    .await
+                    .write_all(b"-ERR no key provided\r\n")
+                    .await?;
                 continue;
             };
             let Some(value) = map.get(key) else {
                 drop(map);
-                stream.write_all(b"$-1\r\n").await?;
+                stream.write().await.write_all(b"$-1\r\n").await?;
                 continue;
             };
             if value.ttl != 0 && Utc::now().timestamp_millis() - value.created_at >= value.ttl {
@@ -207,32 +215,45 @@ async fn handle_stream(
                 let mut map = shared_map.write().await;
                 map.remove(key);
                 drop(map);
-                stream.write_all(b"$-1\r\n").await?;
+                stream.write().await.write_all(b"$-1\r\n").await?;
                 continue;
             }
             stream
+                .write()
+                .await
                 .write_all(format!("+{}\r\n", value.value).as_bytes())
                 .await?;
         } else if command.contains(&String::from("replconf")) {
             if command.contains(&String::from("listening-port")) {
                 let Some(port) = command.get(2) else {
-                    stream.write_all(b"-No port provided\r\n").await?;
+                    stream
+                        .write()
+                        .await
+                        .write_all(b"-No port provided\r\n")
+                        .await?;
                     continue;
                 };
                 let mut config = config.write().await;
                 config.insert("slave_port", port.to_owned());
             }
-            stream.write_all(b"+OK\r\n").await?;
+            stream.write().await.write_all(b"+OK\r\n").await?;
         } else if command.contains(&String::from("psync")) {
             let Some(replication_id) = command.get_mut(1) else {
-                stream.write_all(b"-ERR no replication id provided").await?;
+                stream
+                    .write()
+                    .await
+                    .write_all(b"-ERR no replication id provided")
+                    .await?;
                 continue;
             };
             if replication_id == "?" {
                 replication_id.clear();
-                replication_id.push_str("abc")
+                let id = generate_random_id(16);
+                replication_id.push_str(id.to_string().as_str());
             }
             stream
+                .write()
+                .await
                 .write_all(
                     to_redis_bulk_string(format!("FULLRESYNC {} 0", replication_id).as_str())
                         .as_bytes(),
@@ -240,17 +261,34 @@ async fn handle_stream(
                 .await?;
             let empty_file_payload = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2")?;
             stream
+                .write()
+                .await
                 .write(format!("${}\r\n", empty_file_payload.len()).as_bytes())
                 .await?;
-            stream.write(empty_file_payload.as_slice()).await?;
-            let mut rx = rx.write().await;
-            while let Some(received) = rx.recv().await {
-                stream.write_all(received.as_bytes()).await?;
+            stream
+                .write()
+                .await
+                .write(empty_file_payload.as_slice())
+                .await?;
+            // store all the streams
+            replicas.push(stream.clone());
+            for replica in &replicas {
+                let mut stream = replica.write().await;
+                let mut rx = tx.subscribe();
+                while let Ok(received) = rx.recv().await {
+                    stream.write_all(received.as_bytes()).await?;
+                }
             }
         } else {
-            stream.write_all(b"-ERR unknown command\r\n").await?;
+            stream
+                .write()
+                .await
+                .write_all(b"-ERR unknown command\r\n")
+                .await?;
         }
     }
+
+    Ok(())
 }
 
 fn parse_resp(buf: &[u8]) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
@@ -289,4 +327,20 @@ struct Value {
     value: String,
     created_at: i64,
     ttl: i64,
+}
+
+fn generate_random_id(length: usize) -> String {
+    let mut rng = rand::thread_rng();
+    let id: String = (0..length)
+        .map(|_| {
+            let idx = rng.gen_range(0..52);
+            let c = if idx < 26 {
+                (b'a' + idx as u8) as char
+            } else {
+                (b'A' + (idx - 26) as u8) as char
+            };
+            c
+        })
+        .collect();
+    id
 }
