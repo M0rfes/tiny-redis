@@ -110,7 +110,6 @@ async fn handle_stream(
     tx: Sender<String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = [0; 512];
-    let req_time = Utc::now().timestamp_millis();
     let role = match config.read().await.get("master_host") {
         Some(_) => Role::Slave,
         None => Role::Master,
@@ -145,6 +144,7 @@ async fn handle_stream(
                 .write_all(format!("+{}\r\n", message).as_bytes())
                 .await?;
         } else if command.contains(&String::from("set")) {
+            println!("set called at {}", Utc::now());
             let default = String::from("");
             let Some(key) = command.get(1) else {
                 stream
@@ -178,9 +178,10 @@ async fn handle_stream(
                 }
                 ttl = _ttl.unwrap();
             }
+
             let v = Value {
                 value: value.to_owned(),
-                created_at: req_time,
+                created_at: Utc::now().timestamp_millis(),
                 ttl,
             };
             let mut map = shared_map.write().await;
@@ -196,6 +197,7 @@ async fn handle_stream(
                 _ => (),
             };
         } else if command.contains(&String::from("get")) {
+            println!("get called at {}", Utc::now());
             let map = shared_map.read().await;
             let Some(key) = command.get(1) else {
                 stream
