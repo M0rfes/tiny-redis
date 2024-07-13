@@ -119,7 +119,7 @@ async fn handle_stream(
     loop {
         let read_count = stream.write().await.read(&mut buf).await?;
         if read_count == 0 {
-            break;
+            continue;
         }
         let mut command = parse_resp(&buf)?;
 
