@@ -166,12 +166,12 @@ async fn handle_stream(
                         .await?;
                     continue;
                 }
-                let _ttl = _ttl.unwrap().parse::<u32>();
+                let _ttl = _ttl.unwrap().parse::<i64>();
                 if _ttl.is_err() {
                     stream
                         .write()
                         .await
-                        .write_all(b"-ttl not valid u64\r\n")
+                        .write_all(b"-ttl not valid i64\r\n")
                         .await?;
                     continue;
                 }
@@ -180,7 +180,7 @@ async fn handle_stream(
 
             let v = Value {
                 value: value.to_owned(),
-                created_at: Utc::now().timestamp_subsec_millis(),
+                created_at: Utc::now().timestamp_millis(),
                 ttl,
             };
             let mut map = shared_map.write().await;
@@ -191,7 +191,7 @@ async fn handle_stream(
 
             match role {
                 Role::Master => {
-                    tx.send(message)?;
+                    let _ = tx.send(message);
                 }
                 _ => (),
             };
@@ -210,15 +210,8 @@ async fn handle_stream(
                 stream.write().await.write_all(b"$-1\r\n").await?;
                 continue;
             };
-            println!(
-                "now - then: {} ttl: {}",
-                Utc::now().timestamp_subsec_millis() - value.created_at,
-                value.ttl
-            );
-            if false
-                && value.ttl != 0
-                && Utc::now().timestamp_subsec_millis() - value.created_at >= value.ttl
-            {
+
+            if value.ttl != 0 && Utc::now().timestamp_millis() - value.created_at >= value.ttl {
                 drop(map);
                 let mut map = shared_map.write().await;
                 map.remove(key);
@@ -280,10 +273,10 @@ async fn handle_stream(
                 .await?;
             // store all the streams
             replicas.push(stream.clone());
-            for replica in &replicas {
-                let mut stream = replica.write().await;
-                let mut rx = tx.subscribe();
-                while let Ok(received) = rx.recv().await {
+            let mut rx = tx.subscribe();
+            while let Ok(received) = rx.recv().await {
+                for replica in &replicas {
+                    let mut stream = replica.write().await;
                     stream.write_all(received.as_bytes()).await?;
                 }
             }
@@ -333,8 +326,8 @@ fn format_as_resp_array(vec: Vec<String>) -> String {
 
 struct Value {
     value: String,
-    created_at: u32,
-    ttl: u32,
+    created_at: i64,
+    ttl: i64,
 }
 
 fn generate_random_id(length: usize) -> String {
