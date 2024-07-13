@@ -144,7 +144,6 @@ async fn handle_stream(
                 .write_all(format!("+{}\r\n", message).as_bytes())
                 .await?;
         } else if command.contains(&String::from("set")) {
-            println!("set called at {}", Utc::now());
             let default = String::from("");
             let Some(key) = command.get(1) else {
                 stream
@@ -156,7 +155,7 @@ async fn handle_stream(
             };
             let value = command.get(2).unwrap_or(&default);
             let k = key.to_string();
-            let mut ttl: i64 = 0;
+            let mut ttl = 0;
             if let Some(px_index) = command.iter().position(|s| s.to_lowercase() == "px") {
                 let _ttl = command.get(px_index + 1);
                 if _ttl.is_none() {
@@ -167,7 +166,7 @@ async fn handle_stream(
                         .await?;
                     continue;
                 }
-                let _ttl = _ttl.unwrap().parse::<i64>();
+                let _ttl = _ttl.unwrap().parse::<u32>();
                 if _ttl.is_err() {
                     stream
                         .write()
@@ -181,7 +180,7 @@ async fn handle_stream(
 
             let v = Value {
                 value: value.to_owned(),
-                created_at: Utc::now().timestamp_millis(),
+                created_at: Utc::now().timestamp_subsec_millis(),
                 ttl,
             };
             let mut map = shared_map.write().await;
@@ -197,7 +196,6 @@ async fn handle_stream(
                 _ => (),
             };
         } else if command.contains(&String::from("get")) {
-            println!("get called at {}", Utc::now());
             let map = shared_map.read().await;
             let Some(key) = command.get(1) else {
                 stream
@@ -212,7 +210,14 @@ async fn handle_stream(
                 stream.write().await.write_all(b"$-1\r\n").await?;
                 continue;
             };
-            if value.ttl != 0 && Utc::now().timestamp_millis() - value.created_at >= value.ttl {
+            println!(
+                "now - then: {} ttl: {}",
+                Utc::now().timestamp_subsec_millis() - value.created_at,
+                value.ttl
+            );
+            if value.ttl != 0
+                && Utc::now().timestamp_subsec_millis() - value.created_at >= value.ttl
+            {
                 drop(map);
                 let mut map = shared_map.write().await;
                 map.remove(key);
@@ -327,8 +332,8 @@ fn format_as_resp_array(vec: Vec<String>) -> String {
 
 struct Value {
     value: String,
-    created_at: i64,
-    ttl: i64,
+    created_at: u32,
+    ttl: u32,
 }
 
 fn generate_random_id(length: usize) -> String {
