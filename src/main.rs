@@ -119,7 +119,7 @@ async fn handle_stream(
     loop {
         let read_count = stream.write().await.read(&mut buf).await?;
         if read_count == 0 {
-            continue;
+            break;
         }
         let mut command = parse_resp(&buf)?;
 
@@ -215,7 +215,8 @@ async fn handle_stream(
                 Utc::now().timestamp_subsec_millis() - value.created_at,
                 value.ttl
             );
-            if value.ttl != 0
+            if false
+                && value.ttl != 0
                 && Utc::now().timestamp_subsec_millis() - value.created_at >= value.ttl
             {
                 drop(map);
