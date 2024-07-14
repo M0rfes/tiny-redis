@@ -83,194 +83,206 @@ async fn handle_stream(
         if read_count == 0 {
             break;
         }
-        let mut command = parse_resp(&buf)?;
-
-        if command.contains(&String::from("info")) {
-            let mut response = to_redis_bulk_string(format!("role:{}", role).as_str());
-            // master_replid: 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb
-            response = to_redis_bulk_string(
-                format!("{response}master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb")
-                    .as_str(),
-            );
-            // master_repl_offset: 0
-            response = to_redis_bulk_string(format!("{response}master_repl_offset:0").as_str());
-            stream.write().await.write_all(response.as_bytes()).await?;
-        } else if command.contains(&String::from("ping")) {
-            stream.write().await.write_all(b"+PONG\r\n").await?;
-        } else if command.contains(&String::from("echo")) {
-            let default = String::from("");
-            let message = command.get(1).unwrap_or(&default);
-            stream
-                .write()
-                .await
-                .write_all(format!("+{}\r\n", message).as_bytes())
-                .await?;
-        } else if command.contains(&String::from("set")) {
-            let default = String::from("");
-            let Some(key) = command.get(1) else {
+        let commands = match parse_resp(&buf[..read_count]) {
+            Ok(c) => c,
+            Err(e) => panic!("{e:?}"),
+        };
+        for mut command in commands {
+            if command.contains(&String::from("info")) {
+                let mut response = to_redis_bulk_string(format!("role:{}", role).as_str());
+                response = to_redis_bulk_string(
+                    format!("{response}master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb")
+                        .as_str(),
+                );
+                response = to_redis_bulk_string(format!("{response}master_repl_offset:0").as_str());
+                stream.write().await.write_all(response.as_bytes()).await?;
+            } else if command.contains(&String::from("ping")) {
+                stream.write().await.write_all(b"+PONG\r\n").await?;
+            } else if command.contains(&String::from("echo")) {
+                let default = String::from("");
+                let message = command.get(1).unwrap_or(&default);
                 stream
                     .write()
                     .await
-                    .write_all(b"-ERR no key provided\r\n")
+                    .write_all(format!("+{}\r\n", message).as_bytes())
                     .await?;
-                continue;
-            };
-            let value = command.get(2).unwrap_or(&default);
-            let k = key.to_string();
-            let mut ttl = 0;
-            if let Some(px_index) = command.iter().position(|s| s.to_lowercase() == "px") {
-                let _ttl = command.get(px_index + 1);
-                if _ttl.is_none() {
+            } else if command.contains(&String::from("set")) {
+                let default = String::from("");
+                let Some(key) = command.get(1) else {
                     stream
                         .write()
                         .await
-                        .write_all(b"-no ttl provided\r\n")
-                        .await?;
-                    continue;
-                }
-                let _ttl = _ttl.unwrap().parse::<i64>();
-                if _ttl.is_err() {
-                    stream
-                        .write()
-                        .await
-                        .write_all(b"-ttl not valid i64\r\n")
-                        .await?;
-                    continue;
-                }
-                ttl = _ttl.unwrap();
-            }
-
-            let v = Value {
-                value: value.to_owned(),
-                created_at: Utc::now().timestamp_millis(),
-                ttl,
-            };
-            let mut map = shared_map.write().await;
-            map.insert(k, v);
-            drop(map);
-            stream.write().await.write_all(b"+OK\r\n").await?;
-            let message = format_as_resp_array(command[..3].to_vec());
-
-            match role {
-                Role::Master => {
-                    let _ = tx.send(message);
-                }
-                _ => (),
-            };
-        } else if command.contains(&String::from("get")) {
-            let map = shared_map.read().await;
-            let Some(key) = command.get(1) else {
-                stream
-                    .write()
-                    .await
-                    .write_all(b"-ERR no key provided\r\n")
-                    .await?;
-                continue;
-            };
-            let Some(value) = map.get(key) else {
-                drop(map);
-                stream.write().await.write_all(b"$-1\r\n").await?;
-                continue;
-            };
-
-            if value.ttl != 0 && Utc::now().timestamp_millis() - value.created_at >= value.ttl {
-                drop(map);
-                let mut map = shared_map.write().await;
-                map.remove(key);
-                drop(map);
-                stream.write().await.write_all(b"$-1\r\n").await?;
-                continue;
-            }
-            stream
-                .write()
-                .await
-                .write_all(format!("+{}\r\n", value.value).as_bytes())
-                .await?;
-        } else if command.contains(&String::from("replconf")) {
-            if command.contains(&String::from("listening-port")) {
-                let Some(port) = command.get(2) else {
-                    stream
-                        .write()
-                        .await
-                        .write_all(b"-No port provided\r\n")
+                        .write_all(b"-ERR no key provided\r\n")
                         .await?;
                     continue;
                 };
-                let mut config = config.write().await;
-                config.insert("slave_port", port.to_owned());
-            }
-            stream.write().await.write_all(b"+OK\r\n").await?;
-        } else if command.contains(&String::from("psync")) {
-            let Some(replication_id) = command.get_mut(1) else {
+                let value = command.get(2).unwrap_or(&default);
+                let k = key.to_string();
+                let mut ttl = 0;
+                if let Some(px_index) = command.iter().position(|s| s.to_lowercase() == "px") {
+                    let _ttl = command.get(px_index + 1);
+                    if _ttl.is_none() {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-no ttl provided\r\n")
+                            .await?;
+                        continue;
+                    }
+                    let _ttl = _ttl.unwrap().parse::<i64>();
+                    if _ttl.is_err() {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ttl not valid i64\r\n")
+                            .await?;
+                        continue;
+                    }
+                    ttl = _ttl.unwrap();
+                }
+
+                let v = Value {
+                    value: value.to_owned(),
+                    created_at: Utc::now().timestamp_millis(),
+                    ttl,
+                };
+                let mut map = shared_map.write().await;
+                map.insert(k, v);
+                drop(map);
+                let message = format_as_resp_array(command[..3].to_vec());
+
+                stream.write().await.write_all(b"+OK\r\n").await?;
+                match role {
+                    Role::Master => {
+                        let r = tx.send(message);
+                        println!("{r:?}\n------------------------");
+                    }
+                    _ => (),
+                };
+            } else if command.contains(&String::from("get")) {
+                let Some(key) = command.get(1) else {
+                    stream
+                        .write()
+                        .await
+                        .write_all(b"-ERR no key provided\r\n")
+                        .await?;
+                    continue;
+                };
+                let map = shared_map.read().await;
+                let Some(value) = map.get(key) else {
+                    drop(map);
+                    stream.write().await.write_all(b"$-1\r\n").await?;
+                    continue;
+                };
+
+                if value.ttl != 0 && Utc::now().timestamp_millis() - value.created_at >= value.ttl {
+                    drop(map);
+                    let mut map = shared_map.write().await;
+                    map.remove(key);
+                    drop(map);
+                    stream.write().await.write_all(b"$-1\r\n").await?;
+                    continue;
+                }
                 stream
                     .write()
                     .await
-                    .write_all(b"-ERR no replication id provided")
+                    .write_all(format!("+{}\r\n", value.value).as_bytes())
                     .await?;
-                continue;
-            };
-            if replication_id == "?" {
-                replication_id.clear();
-                let id = generate_random_id(16);
-                replication_id.push_str(id.to_string().as_str());
-            }
-            stream
-                .write()
-                .await
-                .write_all(
-                    to_redis_bulk_string(format!("FULLRESYNC {} 0", replication_id).as_str())
-                        .as_bytes(),
-                )
-                .await?;
-            let empty_file_payload = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2")?;
-            stream
-                .write()
-                .await
-                .write(format!("${}\r\n", empty_file_payload.len()).as_bytes())
-                .await?;
-            stream
-                .write()
-                .await
-                .write(empty_file_payload.as_slice())
-                .await?;
-            // store all the streams
-            replicas.push(stream.clone());
-            let mut rx = tx.subscribe();
-            while let Ok(received) = rx.recv().await {
-                for replica in &replicas {
-                    let mut stream = replica.write().await;
-                    stream.write_all(received.as_bytes()).await?;
+            } else if command.contains(&String::from("replconf")) {
+                if command.contains(&String::from("listening-port")) {
+                    let Some(port) = command.get(2) else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-No port provided\r\n")
+                            .await?;
+                        continue;
+                    };
+                    let mut config = config.write().await;
+                    config.insert("slave_port", port.to_owned());
                 }
+                stream.write().await.write_all(b"+OK\r\n").await?;
+            } else if command.contains(&String::from("psync")) {
+                let Some(replication_id) = command.get_mut(1) else {
+                    stream
+                        .write()
+                        .await
+                        .write_all(b"-ERR no replication id provided")
+                        .await?;
+                    continue;
+                };
+                if replication_id == "?" {
+                    replication_id.clear();
+                    let id = generate_random_id(16);
+                    replication_id.push_str(id.to_string().as_str());
+                }
+                stream
+                    .write()
+                    .await
+                    .write_all(
+                        to_redis_bulk_string(format!("FULLRESYNC {} 0", replication_id).as_str())
+                            .as_bytes(),
+                    )
+                    .await?;
+                let empty_file_payload = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2")?;
+                stream
+                    .write()
+                    .await
+                    .write(format!("${}\r\n", empty_file_payload.len()).as_bytes())
+                    .await?;
+                stream
+                    .write()
+                    .await
+                    .write(empty_file_payload.as_slice())
+                    .await?;
+                // store all the streams
+                replicas.push(stream.clone());
+                while let Ok(received) = tx.subscribe().recv().await {
+                    for replica in &replicas {
+                        let mut stream = replica.write().await;
+                        stream.write_all(received.as_bytes()).await?;
+                    }
+                }
+            } else {
+                stream
+                    .write()
+                    .await
+                    .write_all(b"-ERR unknown command\r\n")
+                    .await?;
             }
-        } else {
-            stream
-                .write()
-                .await
-                .write_all(b"-ERR unknown command\r\n")
-                .await?;
         }
     }
 
     Ok(())
 }
 
-fn parse_resp(buf: &[u8]) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+fn parse_resp(buf: &[u8]) -> Result<Vec<Vec<String>>, Box<dyn Error + Send + Sync>> {
     let message = String::from_utf8_lossy(buf);
-    let mut lines = message.lines();
+    let mut lines = message.lines().peekable();
+    let mut commands = Vec::new();
 
-    let item_num_line = lines.next().ok_or("message is empty")?;
-    let item_nums: usize = item_num_line[1..].parse()?;
+    while lines.peek().is_some() {
+        let item_num_line = lines.next().ok_or("message is empty")?;
+        if !item_num_line.starts_with('*') {
+            return Err(format!("expected array format but got {item_num_line}").into());
+        }
+        let item_nums: usize = item_num_line[1..].parse()?;
 
-    let mut command = Vec::with_capacity(item_nums);
-    for _ in 0..item_nums {
-        let bulk_len_line = lines.next().ok_or("bulk length line is empty")?;
-        let _bulk_len: usize = bulk_len_line[1..].parse()?;
+        let mut command = Vec::with_capacity(item_nums);
+        for _ in 0..item_nums {
+            let bulk_len_line = lines.next().ok_or("bulk length line is empty")?;
+            if !bulk_len_line.starts_with('$') {
+                return Err("expected bulk string format".into());
+            }
+            let _bulk_len: usize = bulk_len_line[1..].parse()?;
 
-        let bulk_str = lines.next().ok_or("bulk string line is empty")?;
-        command.push(bulk_str.to_lowercase());
+            let bulk_str = lines.next().ok_or("bulk string line is empty")?;
+            command.push(bulk_str.to_lowercase());
+        }
+        commands.push(command);
     }
 
-    Ok(command)
+    Ok(commands)
 }
 
 fn to_redis_bulk_string(input: &str) -> String {
@@ -286,6 +298,7 @@ fn format_as_resp_array(vec: Vec<String>) -> String {
     resp_string
 }
 
+#[derive(Debug)]
 struct Value {
     value: String,
     created_at: i64,
@@ -349,51 +362,63 @@ async fn run_replica(
         .await?;
     let _n = socket.read(&mut buf).await?;
     let _n = socket.read(&mut buf).await?;
+    let mut offset: usize = 0;
     loop {
         let n = socket.read(&mut buf).await?;
         if n == 0 {
-            continue;
+            break;
         } else {
-            let Ok(command) = parse_resp(&buf[..n]) else {
-                panic!("error parsing {}", String::from_utf8_lossy(&buf[..n]));
+            let Ok(commands) = parse_resp(&buf[..n]) else {
+                continue;
             };
-            if command.contains(&String::from("set")) {
-                let default = String::from("");
-                let Some(key) = command.get(1) else {
-                    continue;
-                };
-                let value = command.get(2).unwrap_or(&default);
-                let k = key.to_string();
-                let mut ttl = 0;
-                if let Some(px_index) = command.iter().position(|s| s.to_lowercase() == "px") {
-                    let _ttl = command.get(px_index + 1);
-                    if _ttl.is_none() {
+            for command in commands {
+                println!("{command:?}");
+                if command.contains(&String::from("ping")) {
+                    offset += buf[..n].len();
+                    println!("{offset}");
+                } else if command.contains(&String::from("set")) {
+                    offset += buf[..n].len();
+                    println!("{offset}");
+                    let default = String::from("");
+                    let Some(key) = command.get(1) else {
                         continue;
+                    };
+                    let value = command.get(2).unwrap_or(&default);
+                    let k = key.to_string();
+                    let mut ttl = 0;
+                    if let Some(px_index) = command.iter().position(|s| s.to_lowercase() == "px") {
+                        let _ttl = command.get(px_index + 1);
+                        if _ttl.is_none() {
+                            continue;
+                        }
+                        let _ttl = _ttl.unwrap().parse::<i64>();
+                        if _ttl.is_err() {
+                            continue;
+                        }
+                        ttl = _ttl.unwrap();
                     }
-                    let _ttl = _ttl.unwrap().parse::<i64>();
-                    if _ttl.is_err() {
-                        continue;
-                    }
-                    ttl = _ttl.unwrap();
+
+                    let v = Value {
+                        value: value.to_owned(),
+                        created_at: Utc::now().timestamp_millis(),
+                        ttl,
+                    };
+                    let mut map = shared_map.write().await;
+                    map.insert(k, v);
+                    drop(map);
+                } else if command.contains(&String::from("replconf")) {
+                    let replay: Vec<String> = format!("REPLCONF ACK {}", offset)
+                        .split(" ")
+                        .map(str::to_string)
+                        .collect();
+
+                    offset += buf[..n].len();
+                    println!("{offset}");
+                    let replay = format_as_resp_array(replay);
+                    socket.write_all(replay.as_bytes()).await?;
                 }
-
-                let v = Value {
-                    value: value.to_owned(),
-                    created_at: Utc::now().timestamp_millis(),
-                    ttl,
-                };
-                let mut map = shared_map.write().await;
-                map.insert(k, v);
-                drop(map);
-            } else if command.contains(&String::from("replconf")) {
-                let replay: Vec<String> = String::from("REPLCONF ACK 0")
-                    .split(" ")
-                    .map(str::to_string)
-                    .collect();
-
-                let replay = format_as_resp_array(replay);
-                socket.write_all(replay.as_bytes()).await?;
             }
         }
     }
+    Ok(())
 }
