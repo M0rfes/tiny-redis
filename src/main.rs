@@ -32,48 +32,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     if let Some(master_host) = config.get("master_host") {
         let master_port = config.get("master_port").unwrap();
-        let address = format!("{master_host}:{master_port}");
-        let mut socket = TcpStream::connect(address).await?;
-        socket.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
-        let mut buf = [0; 1024];
-        let n = socket.read(&mut buf).await?;
-        let response = String::from_utf8_lossy(&buf[..n]);
-        if response.trim() != "+PONG" {
-            panic!("wanted pong got:{response}");
-        }
         let port = config.get("port").unwrap();
-
-        socket
-            .write_all(
-                format!(
-                    "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n{}\r\n",
-                    port
-                )
-                .as_bytes(),
-            )
-            .await?;
-        let mut buf = [0; 1024];
-        let n = socket.read(&mut buf).await?;
-        let response = String::from_utf8_lossy(&buf[..n]);
-        if response.trim() != "+OK" {
-            panic!("wanted OK got:{response}");
-        }
-        socket
-            .write_all(
-                format!("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n",).as_bytes(),
-            )
-            .await?;
-        let mut buf = [0; 1024];
-        let n = socket.read(&mut buf).await?;
-        let response = String::from_utf8_lossy(&buf[..n]);
-        if response.trim() != "+OK" {
-            panic!("wanted OK got:{response}");
-        }
-        socket
-            .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
-            .await?;
-        let mut buf = [0; 1024];
-        let _n = socket.read(&mut buf).await?;
+        let address = format!("{master_host}:{master_port}");
+        let map_clone = shared_map.clone();
+        tokio::spawn(run_replica(address.to_owned(), port.to_owned(), map_clone));
     }
     let config = Arc::new(RwLock::new(config));
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
@@ -344,4 +306,83 @@ fn generate_random_id(length: usize) -> String {
         })
         .collect();
     id
+}
+
+async fn run_replica(
+    address: String,
+    port: String,
+    shared_map: Arc<RwLock<HashMap<String, Value>>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut socket = TcpStream::connect(address).await?;
+    socket.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
+    let mut buf = [0; 1024];
+    let n = socket.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    if response.trim() != "+PONG" {
+        panic!("wanted pong got:{response}");
+    }
+
+    socket
+        .write_all(
+            format!(
+                "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n{}\r\n",
+                port
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let n = socket.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    if response.trim() != "+OK" {
+        panic!("wanted OK got:{response}");
+    }
+    socket
+        .write_all(format!("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n",).as_bytes())
+        .await?;
+    let n = socket.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    if response.trim() != "+OK" {
+        panic!("wanted OK got:{response}");
+    }
+    socket
+        .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .await?;
+    let _n = socket.read(&mut buf).await?;
+    loop {
+        let n = socket.read(&mut buf).await?;
+        if n == 0 {
+            continue;
+        } else {
+            let command = parse_resp(&buf[..n])?;
+            if command.contains(&String::from("set")) {
+                let default = String::from("");
+                let Some(key) = command.get(1) else {
+                    continue;
+                };
+                let value = command.get(2).unwrap_or(&default);
+                let k = key.to_string();
+                let mut ttl = 0;
+                if let Some(px_index) = command.iter().position(|s| s.to_lowercase() == "px") {
+                    let _ttl = command.get(px_index + 1);
+                    if _ttl.is_none() {
+                        continue;
+                    }
+                    let _ttl = _ttl.unwrap().parse::<i64>();
+                    if _ttl.is_err() {
+                        continue;
+                    }
+                    ttl = _ttl.unwrap();
+                }
+
+                let v = Value {
+                    value: value.to_owned(),
+                    created_at: Utc::now().timestamp_millis(),
+                    ttl,
+                };
+                let mut map = shared_map.write().await;
+                map.insert(k, v);
+                drop(map);
+            }
+        }
+    }
 }
