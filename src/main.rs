@@ -348,12 +348,15 @@ async fn run_replica(
         .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
         .await?;
     let _n = socket.read(&mut buf).await?;
+    let _n = socket.read(&mut buf).await?;
     loop {
         let n = socket.read(&mut buf).await?;
         if n == 0 {
             continue;
         } else {
-            let command = parse_resp(&buf[..n])?;
+            let Ok(command) = parse_resp(&buf[..n]) else {
+                panic!("error parsing {}", String::from_utf8_lossy(&buf[..n]));
+            };
             if command.contains(&String::from("set")) {
                 let default = String::from("");
                 let Some(key) = command.get(1) else {
@@ -382,6 +385,14 @@ async fn run_replica(
                 let mut map = shared_map.write().await;
                 map.insert(k, v);
                 drop(map);
+            } else if command.contains(&String::from("replconf")) {
+                let replay: Vec<String> = String::from("REPLCONF ACK 0")
+                    .split(" ")
+                    .map(str::to_string)
+                    .collect();
+
+                let replay = format_as_resp_array(replay);
+                socket.write_all(replay.as_bytes()).await?;
             }
         }
     }
