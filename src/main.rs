@@ -445,7 +445,12 @@ impl Redis {
                     return Ok(());
                 }
                 if command.parts.contains(&String::from("wait")) {
-                    stream.write().await.write_all(b":0\r\n").await?;
+                    let replica_count = self.replicas.read().await.len();
+                    stream
+                        .write()
+                        .await
+                        .write_all(format!(":{replica_count}\r\n").as_bytes())
+                        .await?;
                 }
             }
         }
