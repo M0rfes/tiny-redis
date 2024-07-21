@@ -1,11 +1,15 @@
 // Uncomment this block to pass the first stage
 use chrono::Utc;
+use core::sync;
 use rand::Rng;
 use std::env;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, error::Error, str, sync::Arc};
 use tokio::net::TcpStream;
+use tokio::stream;
 use tokio::sync::broadcast::{self, Sender};
 use tokio::sync::RwLock;
+use tokio::time::{interval, sleep, Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -93,6 +97,7 @@ struct Redis {
     master_address: Option<String>,
     replicas: ThreadSafe<Vec<ThreadSafe<TcpStream>>>,
     tx: Sender<String>,
+    offset: Arc<AtomicUsize>,
 }
 
 unsafe impl Send for Redis {}
@@ -127,6 +132,7 @@ impl Redis {
             master_address,
             replicas,
             tx,
+            offset: Arc::new(AtomicUsize::new(0)),
         }
     }
     pub async fn init(self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -239,6 +245,7 @@ impl Redis {
                         drop(map);
                     }
                 }
+
                 if replconf_command.is_some() {
                     let command = replconf_command.unwrap();
                     let replay = format!("REPLCONF ACK {}", offset).to_resp_array();
@@ -253,6 +260,11 @@ impl Redis {
 
     async fn run(self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port)).await?;
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            let gc = self_clone.gc().await;
+            println!("GC: {gc:?}");
+        });
         let self_clone = self.clone();
         tokio::spawn(async move {
             let p = self_clone.propagate().await;
@@ -354,12 +366,11 @@ impl Redis {
                     map.insert(k, v);
                     drop(map);
                     let message = command.parts[..3].join(" ").to_resp_array();
-                    println!("writing response");
                     stream.write().await.write_all(b"+OK\r\n").await?;
-                    println!("set done");
+                    self.offset.fetch_add(command.bytes, Ordering::SeqCst);
                     if is_master && !self.replicas.read().await.is_empty() {
                         let set = self.tx.send(message);
-                        println!("{set:?}");
+                        println!("propagated {set:?}");
                     }
                 }
                 if command.parts.contains(&String::from("get")) {
@@ -445,17 +456,128 @@ impl Redis {
                     return Ok(());
                 }
                 if command.parts.contains(&String::from("wait")) {
-                    let replica_count = self.replicas.read().await.len();
-                    stream
-                        .write()
-                        .await
-                        .write_all(format!(":{replica_count}\r\n").as_bytes())
-                        .await?;
+                    let stream = stream.clone();
+                    let Some(min_replica_count) = command.parts.get(1) else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR no replica count\r\n")
+                            .await?;
+                        continue;
+                    };
+                    let Ok(min_replica_count) = min_replica_count.parse::<i64>() else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR count should be u64\r\n")
+                            .await?;
+                        continue;
+                    };
+                    let Some(timeout) = command.parts.get(2) else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR no timeout\r\n")
+                            .await?;
+                        continue;
+                    };
+                    let Ok(timeout) = timeout.parse::<i64>() else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR timeout should be u64\r\n")
+                            .await?;
+                        continue;
+                    };
+                    let res = self.wait(stream, min_replica_count, timeout).await;
+                    println!("wait res: {res:?}");
                 }
             }
         }
     }
+    async fn wait(
+        &self,
+        stream: ThreadSafe<TcpStream>,
+        min_replica_count: i64,
+        timeout: i64,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let deadline = Utc::now().timestamp_millis() + timeout;
+        let propagation_count = Arc::new(AtomicUsize::new(0));
+        loop {
+            let time_remaining = deadline - Utc::now().timestamp_millis();
+            println!("---->{time_remaining}");
+            if time_remaining <= 0 {
+                let propagation_count = propagation_count.load(Ordering::SeqCst);
+                let t = stream
+                    .write()
+                    .await
+                    .write_all(format!(":{propagation_count}\r\n").as_bytes())
+                    .await;
+                println!("t: {t:?}");
+                break;
+            }
+            for (i, replica) in self.replicas.read().await.iter().enumerate() {
+                let stream = stream.clone();
+                let propagation_count = propagation_count.clone();
+                let self_clone = self.clone();
+                let replica = replica.clone();
+                tokio::spawn(async move {
+                    let ack = "REPLCONF GETACK *".to_resp_array();
+                    replica
+                        .write()
+                        .await
+                        .write_all(ack.as_bytes())
+                        .await
+                        .unwrap();
+                    let mut buf = [0; 1020];
+                    let count = replica.write().await.read(&mut buf).await.unwrap();
+                    let Ok(reply) = String::from_utf8_lossy(&buf[..count]).to_command_list() else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR ack failed\r\n")
+                            .await
+                            .unwrap();
+                        return ();
+                    };
+                    let offset = if !reply.is_empty() {
+                        let Ok(offset) = reply[0].parts[2].parse::<usize>() else {
+                            stream
+                                .write()
+                                .await
+                                .write_all(b"-ERR offset not of type u64\r\n")
+                                .await
+                                .unwrap();
+                            return ();
+                        };
+                        offset
+                    } else {
+                        0
+                    };
+                    let current_offset = self_clone.offset.load(Ordering::SeqCst);
+                    if current_offset <= offset {
+                        propagation_count.fetch_add(1, Ordering::SeqCst);
+                    };
 
+                    // self_clone.offset.fetch_add(37, Ordering::SeqCst);
+                });
+            }
+            let propagation_count = propagation_count.load(Ordering::SeqCst);
+            println!("{propagation_count} {}", min_replica_count as usize);
+            if propagation_count >= min_replica_count as usize {
+                let res = stream
+                    .write()
+                    .await
+                    .write_all(format!(":{propagation_count}\r\n").as_bytes())
+                    .await;
+                println!("res {res:?}");
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        println!("warping up");
+        Ok(())
+    }
     async fn propagate(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("propagation lister active");
         let mut rx = self.tx.subscribe();
@@ -468,6 +590,31 @@ impl Redis {
             }
         }
         Ok(())
+    }
+    async fn gc(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut interval = interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            println!("running GC");
+            let keys_to_remove: Vec<String> = {
+                let map = self.kv.read().await;
+                map.iter()
+                    .filter_map(|(key, val)| {
+                        if val.ttl != 0 && Utc::now().timestamp_millis() - val.created_at >= val.ttl
+                        {
+                            Some(key.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+
+            let mut map = self.kv.write().await;
+            for key in keys_to_remove {
+                map.remove(&key);
+            }
+        }
     }
 }
 
