@@ -3,7 +3,7 @@ use chrono::Utc;
 use core::sync;
 use rand::Rng;
 use std::env;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::HashMap, error::Error, str, sync::Arc};
 use tokio::net::TcpStream;
 use tokio::stream;
@@ -98,6 +98,7 @@ struct Redis {
     replicas: ThreadSafe<Vec<ThreadSafe<TcpStream>>>,
     tx: Sender<String>,
     offset: Arc<AtomicUsize>,
+    write_pending: Arc<AtomicBool>,
 }
 
 unsafe impl Send for Redis {}
@@ -133,6 +134,7 @@ impl Redis {
             replicas,
             tx,
             offset: Arc::new(AtomicUsize::new(0)),
+            write_pending: Arc::new(AtomicBool::new(false)),
         }
     }
     pub async fn init(self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -146,8 +148,7 @@ impl Redis {
     }
 
     async fn run_salve(self) {
-        let err = self.salve().await;
-        println!("replica {err:?}");
+        let _err = self.salve().await;
     }
 
     async fn salve(self) -> Result<usize, Box<dyn Error + Send + Sync>> {
@@ -192,22 +193,18 @@ impl Redis {
         let mut offset: usize = 0;
         loop {
             let n = socket.read(&mut buf).await?;
-            println!("{n}");
             if n == 0 {
                 break;
             } else {
                 let Ok(commands) = String::from_utf8_lossy(&buf[..n]).to_command_list() else {
-                    println!("{n}");
                     continue;
                 };
-                println!("{commands:?}");
                 let replconf_command = commands
                     .iter()
                     .find(|c| c.parts.contains(&String::from("replconf")));
                 let commands = commands
                     .iter()
                     .filter(|c| !c.parts.contains(&String::from("replconf")));
-                println!("{commands:?}");
                 for command in commands {
                     if command.parts.contains(&String::from("ping")) {
                         offset += command.bytes;
@@ -262,13 +259,11 @@ impl Redis {
         let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port)).await?;
         let self_clone = self.clone();
         tokio::spawn(async move {
-            let gc = self_clone.gc().await;
-            println!("GC: {gc:?}");
+            let _gc = self_clone.gc().await;
         });
         let self_clone = self.clone();
         tokio::spawn(async move {
-            let p = self_clone.propagate().await;
-            println!("propagation {p:?}");
+            let _p = self_clone.propagate().await;
         });
         loop {
             let (stream, _) = listener.accept().await?;
@@ -320,7 +315,6 @@ impl Redis {
                         .await?;
                 }
                 if command.parts.contains(&String::from("set")) {
-                    println!("in set");
                     let default = String::from("");
                     let Some(key) = command.parts.get(1) else {
                         stream
@@ -369,8 +363,8 @@ impl Redis {
                     stream.write().await.write_all(b"+OK\r\n").await?;
                     self.offset.fetch_add(command.bytes, Ordering::SeqCst);
                     if is_master && !self.replicas.read().await.is_empty() {
-                        let set = self.tx.send(message);
-                        println!("propagated {set:?}");
+                        self.write_pending.store(true, Ordering::SeqCst);
+                        let _set = self.tx.send(message);
                     }
                 }
                 if command.parts.contains(&String::from("get")) {
@@ -489,8 +483,7 @@ impl Redis {
                             .await?;
                         continue;
                     };
-                    let res = self.wait(stream, min_replica_count, timeout).await;
-                    println!("wait res: {res:?}");
+                    let _res = self.wait(stream, min_replica_count, timeout).await;
                 }
             }
         }
@@ -501,36 +494,64 @@ impl Redis {
         min_replica_count: i64,
         timeout: i64,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let write_pending = self.write_pending.load(Ordering::SeqCst);
+        if !write_pending {
+            let _t = stream
+                .write()
+                .await
+                .write_all(format!(":{}\r\n", self.replicas.read().await.len()).as_bytes())
+                .await;
+            return Ok(());
+        }
         let deadline = Utc::now().timestamp_millis() + timeout;
         let propagation_count = Arc::new(AtomicUsize::new(0));
+        for replica in self.replicas.read().await.iter() {
+            let ack = "REPLCONF GETACK *".to_resp_array();
+            replica
+                .write()
+                .await
+                .write_all(ack.as_bytes())
+                .await
+                .unwrap();
+        }
         loop {
             let time_remaining = deadline - Utc::now().timestamp_millis();
-            println!("---->{time_remaining}");
-            if time_remaining <= 0 {
-                let propagation_count = propagation_count.load(Ordering::SeqCst);
-                let t = stream
+            let pcg = propagation_count.load(Ordering::SeqCst);
+            if time_remaining <= 0 || pcg == self.replicas.read().await.len() {
+                let _t = stream
                     .write()
                     .await
-                    .write_all(format!(":{propagation_count}\r\n").as_bytes())
+                    .write_all(format!(":{pcg}\r\n").as_bytes())
                     .await;
-                println!("t: {t:?}");
-                break;
+                self.write_pending.store(false, Ordering::SeqCst);
+                return Ok(());
             }
+
             for (i, replica) in self.replicas.read().await.iter().enumerate() {
+                let pcg = propagation_count.load(Ordering::SeqCst);
+                if pcg >= min_replica_count as usize {
+                    break;
+                }
+
                 let stream = stream.clone();
                 let propagation_count = propagation_count.clone();
                 let self_clone = self.clone();
                 let replica = replica.clone();
                 tokio::spawn(async move {
-                    let ack = "REPLCONF GETACK *".to_resp_array();
-                    replica
-                        .write()
-                        .await
-                        .write_all(ack.as_bytes())
-                        .await
-                        .unwrap();
+                    println!("wait getting lock for replica {i}");
+                    let Ok(mut rep) = replica.try_write() else {
+                        println!("wait didnt got the lock for replica {i} will try again later");
+                        return ();
+                    };
+                    println!("wait got lock for replica {i}");
+
                     let mut buf = [0; 1020];
-                    let count = replica.write().await.read(&mut buf).await.unwrap();
+                    let Ok(count) = rep.try_read(&mut buf) else {
+                        println!("wait failed to read {i}");
+                        return ();
+                    };
+                    drop(rep);
+                    println!("wait release the lock for {i}");
                     let Ok(reply) = String::from_utf8_lossy(&buf[..count]).to_command_list() else {
                         stream
                             .write()
@@ -555,47 +576,50 @@ impl Redis {
                         0
                     };
                     let current_offset = self_clone.offset.load(Ordering::SeqCst);
+                    println!("{current_offset} {offset}");
                     if current_offset <= offset {
                         propagation_count.fetch_add(1, Ordering::SeqCst);
                     };
-
-                    // self_clone.offset.fetch_add(37, Ordering::SeqCst);
                 });
+
+                sleep(Duration::from_millis(25)).await;
             }
-            let propagation_count = propagation_count.load(Ordering::SeqCst);
-            println!("{propagation_count} {}", min_replica_count as usize);
-            if propagation_count >= min_replica_count as usize {
-                let res = stream
+            let pcg = propagation_count.load(Ordering::SeqCst);
+            if pcg >= min_replica_count as usize {
+                let _res = stream
                     .write()
                     .await
-                    .write_all(format!(":{propagation_count}\r\n").as_bytes())
+                    .write_all(format!(":{pcg}\r\n").as_bytes())
                     .await;
-                println!("res {res:?}");
-                break;
+                self.write_pending.store(false, Ordering::SeqCst);
+                return Ok(());
             }
-            sleep(Duration::from_millis(50)).await;
+            sleep(Duration::from_millis(25)).await;
         }
-        println!("warping up");
-        Ok(())
     }
     async fn propagate(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        println!("propagation lister active");
         let mut rx = self.tx.subscribe();
         while let Ok(received) = rx.recv().await {
             let replicas = self.replicas.read().await;
             for (i, replica) in replicas.iter().enumerate() {
-                let mut stream = replica.write().await;
-                let res = stream.write_all(received.as_bytes()).await;
-                println!("send {res:?} {i}");
+                println!("propagation getting lock for replica {i}");
+                let Ok(mut stream) = replica.try_write() else {
+                    println!("propagation didnt got lock for replica {i}");
+                    continue;
+                };
+                println!("propagation got lock for replica {i}");
+                let _res = stream.write_all(received.as_bytes()).await;
+                drop(stream);
+                println!("propagation releasing the lock for {i}");
             }
         }
+
         Ok(())
     }
     async fn gc(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut interval = interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            println!("running GC");
             let keys_to_remove: Vec<String> = {
                 let map = self.kv.read().await;
                 map.iter()
