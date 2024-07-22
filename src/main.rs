@@ -1,12 +1,10 @@
 // Uncomment this block to pass the first stage
 use chrono::Utc;
-use core::sync;
 use rand::Rng;
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::HashMap, error::Error, str, sync::Arc};
 use tokio::net::TcpStream;
-use tokio::stream;
 use tokio::sync::broadcast::{self, Sender};
 use tokio::sync::RwLock;
 use tokio::time::{interval, sleep, Duration};
@@ -91,14 +89,24 @@ struct Value {
 }
 
 #[derive(Debug, Clone)]
+struct Config {
+    dir: Option<String>,
+    db_filename: Option<String>,
+    port: u16,
+}
+
+unsafe impl Send for Config {}
+unsafe impl Sync for Config {}
+
+#[derive(Debug, Clone)]
 struct Redis {
     kv: ThreadSafe<HashMap<String, Value>>,
-    port: u16,
     master_address: Option<String>,
     replicas: ThreadSafe<Vec<ThreadSafe<TcpStream>>>,
     tx: Sender<String>,
     offset: Arc<AtomicUsize>,
     write_pending: Arc<AtomicBool>,
+    config: Config,
 }
 
 unsafe impl Send for Redis {}
@@ -124,17 +132,40 @@ impl Redis {
                 replica[1].to_owned()
             ));
         }
+
+        let mut dir = None;
+        if let Some(dir_index) = args.iter().position(|s| s == "--dir") {
+            let _dir = args
+                .get(dir_index + 1)
+                .expect("--dir provided but no dir provided")
+                .to_owned();
+            dir = Some(_dir.to_owned());
+        }
+
+        let mut db_filename = None;
+        if let Some(dir_index) = args.iter().position(|s| s == "--dbfilename") {
+            let _db_filename = args
+                .get(dir_index + 1)
+                .expect("--dir provided but no dir provided")
+                .to_owned();
+            db_filename = Some(_db_filename.to_owned());
+        }
+
         let replicas = Arc::new(RwLock::new(vec![]));
         let (tx, _) = broadcast::channel(100);
 
         Redis {
             kv: Arc::new(RwLock::new(HashMap::new())),
-            port,
             master_address,
             replicas,
             tx,
             offset: Arc::new(AtomicUsize::new(0)),
             write_pending: Arc::new(AtomicBool::new(false)),
+            config: Config {
+                port,
+                dir,
+                db_filename,
+            },
         }
     }
     pub async fn init(self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -166,7 +197,7 @@ impl Redis {
             .write_all(
                 format!(
                     "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n{}\r\n",
-                    self.port
+                    self.config.port
                 )
                 .as_bytes(),
             )
@@ -256,7 +287,7 @@ impl Redis {
     }
 
     async fn run(self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port)).await?;
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.config.port)).await?;
         let self_clone = self.clone();
         tokio::spawn(async move {
             let _gc = self_clone.gc().await;
@@ -367,7 +398,9 @@ impl Redis {
                         let _set = self.tx.send(message);
                     }
                 }
-                if command.parts.contains(&String::from("get")) {
+                if !command.parts.contains(&String::from("config"))
+                    && command.parts.contains(&String::from("get"))
+                {
                     let Some(key) = command.parts.get(1) else {
                         stream
                             .write()
@@ -412,6 +445,82 @@ impl Redis {
                     }
                     stream.write().await.write_all(b"+OK\r\n").await?;
                 }
+                if command.parts.contains(&String::from("wait")) {
+                    let stream = stream.clone();
+                    let Some(min_replica_count) = command.parts.get(1) else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR no replica count\r\n")
+                            .await?;
+                        continue;
+                    };
+                    let Ok(min_replica_count) = min_replica_count.parse::<i64>() else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR count should be u64\r\n")
+                            .await?;
+                        continue;
+                    };
+                    let Some(timeout) = command.parts.get(2) else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR no timeout\r\n")
+                            .await?;
+                        continue;
+                    };
+                    let Ok(timeout) = timeout.parse::<i64>() else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR timeout should be u64\r\n")
+                            .await?;
+                        continue;
+                    };
+                    let _res = self.wait(stream, min_replica_count, timeout).await;
+                }
+                if command.parts.contains(&String::from("config")) {
+                    if command.parts.contains(&String::from("get"))
+                        && command.parts.contains(&String::from("dir"))
+                    {
+                        let Some(dir_replay) = self.config.dir.clone() else {
+                            stream
+                                .write()
+                                .await
+                                .write_all(b"-ERR no dir was provided \r\n")
+                                .await?;
+                            continue;
+                        };
+                        let dir_replay = format!("dir {dir_replay}").to_resp_array();
+                        stream
+                            .write()
+                            .await
+                            .write_all(dir_replay.as_bytes())
+                            .await?;
+                    }
+
+                    if command.parts.contains(&String::from("get"))
+                        && command.parts.contains(&String::from("dbfilename"))
+                    {
+                        let Some(db_filename) = self.config.db_filename.clone() else {
+                            stream
+                                .write()
+                                .await
+                                .write_all(b"-ERR no dir was provided \r\n")
+                                .await?;
+                            continue;
+                        };
+                        let dir_replay = format!("dbfilename {db_filename}").to_resp_array();
+                        stream
+                            .write()
+                            .await
+                            .write_all(dir_replay.as_bytes())
+                            .await?;
+                    }
+                    continue;
+                }
                 if command.parts.contains(&String::from("psync")) {
                     let Some(replication_id) = command.parts.get_mut(1) else {
                         stream
@@ -448,42 +557,6 @@ impl Redis {
                         .await?;
                     self.replicas.write().await.push(stream.clone());
                     return Ok(());
-                }
-                if command.parts.contains(&String::from("wait")) {
-                    let stream = stream.clone();
-                    let Some(min_replica_count) = command.parts.get(1) else {
-                        stream
-                            .write()
-                            .await
-                            .write_all(b"-ERR no replica count\r\n")
-                            .await?;
-                        continue;
-                    };
-                    let Ok(min_replica_count) = min_replica_count.parse::<i64>() else {
-                        stream
-                            .write()
-                            .await
-                            .write_all(b"-ERR count should be u64\r\n")
-                            .await?;
-                        continue;
-                    };
-                    let Some(timeout) = command.parts.get(2) else {
-                        stream
-                            .write()
-                            .await
-                            .write_all(b"-ERR no timeout\r\n")
-                            .await?;
-                        continue;
-                    };
-                    let Ok(timeout) = timeout.parse::<i64>() else {
-                        stream
-                            .write()
-                            .await
-                            .write_all(b"-ERR timeout should be u64\r\n")
-                            .await?;
-                        continue;
-                    };
-                    let _res = self.wait(stream, min_replica_count, timeout).await;
                 }
             }
         }
@@ -538,20 +611,15 @@ impl Redis {
                 let self_clone = self.clone();
                 let replica = replica.clone();
                 tokio::spawn(async move {
-                    println!("wait getting lock for replica {i}");
-                    let Ok(mut rep) = replica.try_write() else {
-                        println!("wait didnt got the lock for replica {i} will try again later");
+                    let Ok(rep) = replica.try_write() else {
                         return ();
                     };
-                    println!("wait got lock for replica {i}");
 
                     let mut buf = [0; 1020];
                     let Ok(count) = rep.try_read(&mut buf) else {
-                        println!("wait failed to read {i}");
                         return ();
                     };
                     drop(rep);
-                    println!("wait release the lock for {i}");
                     let Ok(reply) = String::from_utf8_lossy(&buf[..count]).to_command_list() else {
                         stream
                             .write()
@@ -576,7 +644,6 @@ impl Redis {
                         0
                     };
                     let current_offset = self_clone.offset.load(Ordering::SeqCst);
-                    println!("{current_offset} {offset}");
                     if current_offset <= offset {
                         propagation_count.fetch_add(1, Ordering::SeqCst);
                     };
@@ -602,15 +669,11 @@ impl Redis {
         while let Ok(received) = rx.recv().await {
             let replicas = self.replicas.read().await;
             for (i, replica) in replicas.iter().enumerate() {
-                println!("propagation getting lock for replica {i}");
                 let Ok(mut stream) = replica.try_write() else {
-                    println!("propagation didnt got lock for replica {i}");
                     continue;
                 };
-                println!("propagation got lock for replica {i}");
                 let _res = stream.write_all(received.as_bytes()).await;
                 drop(stream);
-                println!("propagation releasing the lock for {i}");
             }
         }
 
