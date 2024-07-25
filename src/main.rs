@@ -81,13 +81,6 @@ impl<T: AsRef<str>> ToRedis for T {
 
 type ThreadSafe<T> = Arc<RwLock<T>>;
 
-#[derive(Debug)]
-struct Value {
-    value: String,
-    created_at: i64,
-    ttl: i64,
-}
-
 #[derive(Debug, Clone)]
 struct Config {
     dir: Option<String>,
@@ -100,7 +93,8 @@ unsafe impl Sync for Config {}
 
 #[derive(Debug, Clone)]
 struct Redis {
-    kv: ThreadSafe<HashMap<String, Value>>,
+    kv: ThreadSafe<HashMap<String, String>>,
+    expire: ThreadSafe<HashMap<String, i64>>,
     master_address: Option<String>,
     replicas: ThreadSafe<Vec<ThreadSafe<TcpStream>>>,
     tx: Sender<String>,
@@ -156,6 +150,7 @@ impl Redis {
 
         Redis {
             kv: Arc::new(RwLock::new(HashMap::new())),
+            expire: Arc::new(RwLock::new(HashMap::new())),
             master_address,
             replicas,
             tx,
@@ -247,29 +242,25 @@ impl Redis {
                         };
                         let value = command.parts.get(2).unwrap_or(&default);
                         let k = key.to_string();
-                        let mut ttl = 0;
                         if let Some(px_index) =
                             command.parts.iter().position(|s| s.to_lowercase() == "px")
                         {
-                            let _ttl = command.parts.get(px_index + 1);
-                            if _ttl.is_none() {
+                            let ttl = command.parts.get(px_index + 1).and_then(|ttl| {
+                                let Ok(_ttl) = ttl.parse::<i64>() else {
+                                    return None;
+                                };
+                                Some(_ttl)
+                            });
+                            if ttl.is_none() {
                                 continue;
                             }
-                            let _ttl = _ttl.unwrap().parse::<i64>();
-                            if _ttl.is_err() {
-                                continue;
-                            }
-                            ttl = _ttl.unwrap();
+                            let ttl = ttl.unwrap() + Utc::now().timestamp_millis();
+                            self.expire.write().await.insert(k.clone(), ttl);
                         }
 
-                        let v = Value {
-                            value: value.to_owned(),
-                            created_at: Utc::now().timestamp_millis(),
-                            ttl,
-                        };
                         let mut map = self.kv.write().await;
                         offset += command.bytes;
-                        map.insert(k, v);
+                        map.insert(k, value.to_owned());
                         drop(map);
                     }
                 }
@@ -357,38 +348,30 @@ impl Redis {
                     };
                     let value = command.parts.get(2).unwrap_or(&default);
                     let k = key.to_string();
-                    let mut ttl = 0;
                     if let Some(px_index) =
                         command.parts.iter().position(|s| s.to_lowercase() == "px")
                     {
-                        let _ttl = command.parts.get(px_index + 1);
-                        if _ttl.is_none() {
+                        let ttl = command.parts.get(px_index + 1).and_then(|ttl| {
+                            let Ok(_ttl) = ttl.parse::<i64>() else {
+                                return None;
+                            };
+                            Some(_ttl)
+                        });
+                        if ttl.is_none() {
                             stream
                                 .write()
                                 .await
-                                .write_all(b"-no ttl provided\r\n")
+                                .write_all(b"-no ttl must of time number\r\n")
                                 .await?;
                             continue;
                         }
-                        let _ttl = _ttl.unwrap().parse::<i64>();
-                        if _ttl.is_err() {
-                            stream
-                                .write()
-                                .await
-                                .write_all(b"-ttl not valid i64\r\n")
-                                .await?;
-                            continue;
-                        }
-                        ttl = _ttl.unwrap();
+
+                        let ttl = ttl.unwrap() + Utc::now().timestamp_millis();
+                        self.expire.write().await.insert(k.clone(), ttl);
                     }
 
-                    let v = Value {
-                        value: value.to_owned(),
-                        created_at: Utc::now().timestamp_millis(),
-                        ttl,
-                    };
                     let mut map = self.kv.write().await;
-                    map.insert(k, v);
+                    map.insert(k, value.to_owned());
                     drop(map);
                     let message = command.parts[..3].join(" ").to_resp_array();
                     stream.write().await.write_all(b"+OK\r\n").await?;
@@ -411,25 +394,30 @@ impl Redis {
                     };
                     let map = self.kv.read().await;
                     let Some(value) = map.get(key) else {
-                        drop(map);
                         stream.write().await.write_all(b"$-1\r\n").await?;
                         continue;
                     };
-
-                    if value.ttl != 0
-                        && Utc::now().timestamp_millis() - value.created_at >= value.ttl
-                    {
-                        drop(map);
-                        let mut map = self.kv.write().await;
-                        map.remove(key);
-                        drop(map);
+                    let expire = self.expire.read().await;
+                    let ttl = expire.get(key).and_then(|&ttl| {
+                        if Utc::now().timestamp_millis() >= ttl {
+                            Some(())
+                        } else {
+                            None
+                        }
+                    });
+                    drop(expire);
+                    let value = value.clone();
+                    drop(map);
+                    if ttl.is_some() {
                         stream.write().await.write_all(b"$-1\r\n").await?;
+                        self.kv.write().await.remove(key);
                         continue;
                     }
+
                     stream
                         .write()
                         .await
-                        .write_all(format!("+{}\r\n", value.value).as_bytes())
+                        .write_all(format!("+{}\r\n", value).as_bytes())
                         .await?;
                 }
                 if command.parts.contains(&String::from("replconf")) {
@@ -685,16 +673,18 @@ impl Redis {
             interval.tick().await;
             let keys_to_remove: Vec<String> = {
                 let map = self.kv.read().await;
+                let expire = self.expire.read().await;
                 map.iter()
-                    .filter_map(|(key, val)| {
-                        if val.ttl != 0 && Utc::now().timestamp_millis() - val.created_at >= val.ttl
-                        {
-                            Some(key.clone())
-                        } else {
-                            None
-                        }
+                    .filter_map(|(key, _)| {
+                        expire.get(key).and_then(|&ttl| {
+                            if Utc::now().timestamp_millis() >= ttl {
+                                Some(key.clone())
+                            } else {
+                                None
+                            }
+                        })
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             };
 
             let mut map = self.kv.write().await;
