@@ -345,11 +345,23 @@ impl Redis {
                     stream.write().await.write_all(response.as_bytes()).await?;
                 }
                 if command.parts.contains(&String::from("ping")) {
+                    if _self.in_transaction.load(Ordering::SeqCst) {
+                        let mut commands = _self.commands.write().await;
+                        commands.push(command);
+                        stream.write().await.write_all(b"+QUEUED\r\n").await?;
+                        continue;
+                    }
                     stream.write().await.write_all(b"+PONG\r\n").await?;
                 }
                 if command.parts.contains(&String::from("echo")) {
                     let default = String::from("");
                     let message = command.parts.get(1).unwrap_or(&default);
+                    if _self.in_transaction.load(Ordering::SeqCst) {
+                        let mut commands = _self.commands.write().await;
+                        commands.push(command);
+                        stream.write().await.write_all(b"+QUEUED\r\n").await?;
+                        continue;
+                    }
                     stream
                         .write()
                         .await
@@ -357,6 +369,12 @@ impl Redis {
                         .await?;
                 }
                 if command.parts.contains(&String::from("set")) {
+                    if _self.in_transaction.load(Ordering::SeqCst) {
+                        let mut commands = _self.commands.write().await;
+                        commands.push(command);
+                        stream.write().await.write_all(b"+QUEUED\r\n").await?;
+                        continue;
+                    }
                     let default = String::from("");
                     let Some(key) = command.parts.get(1) else {
                         stream
@@ -389,12 +407,6 @@ impl Redis {
                         let ttl = ttl.unwrap() + Utc::now().timestamp_millis();
                         _self.expire.write().await.insert(k.clone(), ttl);
                     }
-                    if _self.in_transaction.load(Ordering::SeqCst) {
-                        let mut commands = _self.commands.write().await;
-                        commands.push(command);
-                        continue;
-                    }
-
                     let mut map = _self.kv.write().await;
                     map.insert(k, value.to_owned());
                     drop(map);
@@ -407,6 +419,12 @@ impl Redis {
                     }
                 }
                 if command.parts.contains(&String::from("incr")) {
+                    if _self.in_transaction.load(Ordering::SeqCst) {
+                        let mut commands = _self.commands.write().await;
+                        commands.push(command);
+                        stream.write().await.write_all(b"+QUEUED\r\n").await?;
+                        continue;
+                    }
                     let Some(key) = command.parts.get(1) else {
                         stream
                             .write()
@@ -415,11 +433,6 @@ impl Redis {
                             .await?;
                         continue;
                     };
-                    if _self.in_transaction.load(Ordering::SeqCst) {
-                        let mut commands = _self.commands.write().await;
-                        commands.push(command);
-                        continue;
-                    }
                     let k = key.to_string();
                     let mut map = _self.kv.write().await;
                     let Some(value) = map.get(&k) else {
@@ -468,6 +481,12 @@ impl Redis {
                 if !command.parts.contains(&String::from("config"))
                     && command.parts.contains(&String::from("get"))
                 {
+                    if _self.in_transaction.load(Ordering::SeqCst) {
+                        let mut commands = _self.commands.write().await;
+                        commands.push(command);
+                        stream.write().await.write_all(b"+QUEUED\r\n").await?;
+                        continue;
+                    }
                     let Some(key) = command.parts.get(1) else {
                         stream
                             .write()
