@@ -393,7 +393,14 @@ impl Redis {
                         stream.write().await.write_all(b":1\r\n").await?;
                         continue;
                     };
-                    let value = value.parse::<i64>().unwrap_or(0);
+                    let Ok(value) = value.parse::<i64>() else {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR value is not an integer or out of range\r\n")
+                            .await?;
+                        continue;
+                    };
                     let value = value + 1;
                     map.insert(k, value.to_string());
                     drop(map);
