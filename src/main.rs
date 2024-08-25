@@ -109,41 +109,34 @@ unsafe impl Sync for Redis {}
 impl Redis {
     pub fn new() -> Self {
         let args: Vec<String> = env::args().collect();
-        let mut port = 6379_u16;
-        if let Some(port_index) = args.iter().position(|s| s == "--port") {
-            port = args
-                .get(port_index + 1)
-                .expect("no port provided")
-                .parse()
-                .expect("port must be valid u16 number");
-        }
-        let mut master_address = None;
-        if let Some(replica_of_index) = args.iter().position(|s| s == "--replicaof") {
-            let replica: Vec<&str> = args.get(replica_of_index + 1).unwrap().split(" ").collect();
-            master_address = Some(format!(
-                "{}:{}",
-                replica[0].to_owned(),
-                replica[1].to_owned()
-            ));
-        }
 
-        let mut dir = None;
-        if let Some(dir_index) = args.iter().position(|s| s == "--dir") {
-            let _dir = args
-                .get(dir_index + 1)
-                .expect("--dir provided but no dir provided")
-                .to_owned();
-            dir = Some(_dir.to_owned());
-        }
+        let port = args
+            .iter()
+            .position(|s| s == "--port")
+            .and_then(|port_index| args.get(port_index + 1))
+            .map(|port_str| port_str.parse::<u16>())
+            .unwrap_or_else(|| Ok(6379_u16))
+            .expect("port must be a valid u16 number");
 
-        let mut db_filename = None;
-        if let Some(dir_index) = args.iter().position(|s| s == "--dbfilename") {
-            let _db_filename = args
-                .get(dir_index + 1)
-                .expect("--dir provided but no dir provided")
-                .to_owned();
-            db_filename = Some(_db_filename.to_owned());
-        }
+        let master_address =
+            args.iter()
+                .position(|s| s == "--replicaof")
+                .and_then(|replica_of_index| {
+                    args.get(replica_of_index + 1)
+                        .map(|s| s.split_whitespace().collect::<Vec<&str>>())
+                        .filter(|replica| replica.len() == 2)
+                        .map(|replica| format!("{}:{}", replica[0], replica[1]))
+                });
+
+        let dir = args
+            .iter()
+            .position(|s| s == "--dir")
+            .and_then(|dir_index| args.get(dir_index + 1).map(|s| s.to_owned()));
+
+        let db_filename = args
+            .iter()
+            .position(|s| s == "--dbfilename")
+            .and_then(|dir_index| args.get(dir_index + 1).map(|s| s.to_owned()));
 
         let replicas = Arc::new(RwLock::new(vec![]));
         let (tx, _) = broadcast::channel(100);
@@ -204,7 +197,9 @@ impl Redis {
         }
         socket
             .write_all(
-                format!("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n",).as_bytes(),
+                "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
+                    .to_string()
+                    .as_bytes(),
             )
             .await?;
         let n = socket.read(&mut buf).await?;
@@ -536,7 +531,7 @@ impl Redis {
                     stream
                         .write()
                         .await
-                        .write(format!("${}\r\n", empty_file_payload.len()).as_bytes())
+                        .write_all(format!("${}\r\n", empty_file_payload.len()).as_bytes())
                         .await?;
                     stream
                         .write()
@@ -556,40 +551,41 @@ impl Redis {
         timeout: i64,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let write_pending = self.write_pending.load(Ordering::SeqCst);
+
         if !write_pending {
-            let _t = stream
+            stream
                 .write()
                 .await
                 .write_all(format!(":{}\r\n", self.replicas.read().await.len()).as_bytes())
-                .await;
+                .await?;
             return Ok(());
         }
+
         let deadline = Utc::now().timestamp_millis() + timeout;
         let propagation_count = Arc::new(AtomicUsize::new(0));
+
         for replica in self.replicas.read().await.iter() {
             let ack = "REPLCONF GETACK *".to_resp_array();
-            replica
-                .write()
-                .await
-                .write_all(ack.as_bytes())
-                .await
-                .unwrap();
+            replica.write().await.write_all(ack.as_bytes()).await?;
         }
+
         loop {
             let time_remaining = deadline - Utc::now().timestamp_millis();
             let pcg = propagation_count.load(Ordering::SeqCst);
+
             if time_remaining <= 0 || pcg == self.replicas.read().await.len() {
-                let _t = stream
+                stream
                     .write()
                     .await
                     .write_all(format!(":{pcg}\r\n").as_bytes())
-                    .await;
+                    .await?;
                 self.write_pending.store(false, Ordering::SeqCst);
                 return Ok(());
             }
 
-            for (i, replica) in self.replicas.read().await.iter().enumerate() {
+            for replica in self.replicas.read().await.iter() {
                 let pcg = propagation_count.load(Ordering::SeqCst);
+
                 if pcg >= min_replica_count as usize {
                     break;
                 }
@@ -598,70 +594,73 @@ impl Redis {
                 let propagation_count = propagation_count.clone();
                 let self_clone = self.clone();
                 let replica = replica.clone();
-                tokio::spawn(async move {
-                    let Ok(rep) = replica.try_write() else {
-                        return ();
-                    };
 
-                    let mut buf = [0; 1020];
-                    let Ok(count) = rep.try_read(&mut buf) else {
-                        return ();
-                    };
-                    drop(rep);
-                    let Ok(reply) = String::from_utf8_lossy(&buf[..count]).to_command_list() else {
-                        stream
-                            .write()
-                            .await
-                            .write_all(b"-ERR ack failed\r\n")
-                            .await
-                            .unwrap();
-                        return ();
-                    };
-                    let offset = if !reply.is_empty() {
-                        let Ok(offset) = reply[0].parts[2].parse::<usize>() else {
-                            stream
-                                .write()
-                                .await
-                                .write_all(b"-ERR offset not of type u64\r\n")
-                                .await
-                                .unwrap();
-                            return ();
-                        };
-                        offset
-                    } else {
-                        0
-                    };
-                    let current_offset = self_clone.offset.load(Ordering::SeqCst);
-                    if current_offset <= offset {
-                        propagation_count.fetch_add(1, Ordering::SeqCst);
-                    };
+                tokio::spawn(async move {
+                    if let Ok(rep) = replica.try_write() {
+                        let mut buf = [0; 1020];
+                        if let Ok(count) = rep.try_read(&mut buf) {
+                            let reply = String::from_utf8_lossy(&buf[..count]).to_command_list();
+                            if let Ok(reply) = reply {
+                                if !reply.is_empty() {
+                                    if let Ok(offset) = reply[0].parts[2].parse::<usize>() {
+                                        let current_offset =
+                                            self_clone.offset.load(Ordering::SeqCst);
+                                        if current_offset <= offset {
+                                            propagation_count.fetch_add(1, Ordering::SeqCst);
+                                        }
+                                    } else {
+                                        stream
+                                            .write()
+                                            .await
+                                            .write_all(b"-ERR offset not of type u64\r\n")
+                                            .await
+                                            .unwrap();
+                                    }
+                                }
+                            } else {
+                                stream
+                                    .write()
+                                    .await
+                                    .write_all(b"-ERR ack failed\r\n")
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    }
                 });
 
                 sleep(Duration::from_millis(25)).await;
             }
+
             let pcg = propagation_count.load(Ordering::SeqCst);
             if pcg >= min_replica_count as usize {
-                let _res = stream
+                stream
                     .write()
                     .await
                     .write_all(format!(":{pcg}\r\n").as_bytes())
-                    .await;
+                    .await?;
                 self.write_pending.store(false, Ordering::SeqCst);
                 return Ok(());
             }
+
             sleep(Duration::from_millis(25)).await;
         }
     }
+
     async fn propagate(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut rx = self.tx.subscribe();
+
         while let Ok(received) = rx.recv().await {
             let replicas = self.replicas.read().await;
-            for (i, replica) in replicas.iter().enumerate() {
-                let Ok(mut stream) = replica.try_write() else {
-                    continue;
-                };
-                let _res = stream.write_all(received.as_bytes()).await;
-                drop(stream);
+
+            for replica in replicas.iter() {
+                if let Ok(mut stream) = replica.try_write() {
+                    if let Err(e) = stream.write_all(received.as_bytes()).await {
+                        eprintln!("Failed to write to replica: {}", e);
+                    }
+                } else {
+                    eprintln!("Failed to acquire write lock for a replica");
+                }
             }
         }
 
@@ -671,7 +670,8 @@ impl Redis {
         let mut interval = interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let keys_to_remove: Vec<String> = {
+
+            let keys_to_remove = {
                 let map = self.kv.read().await;
                 let expire = self.expire.read().await;
                 map.iter()
@@ -687,9 +687,11 @@ impl Redis {
                     .collect::<Vec<_>>()
             };
 
-            let mut map = self.kv.write().await;
-            for key in keys_to_remove {
-                map.remove(&key);
+            if !keys_to_remove.is_empty() {
+                let mut map = self.kv.write().await;
+                for key in keys_to_remove {
+                    map.remove(&key);
+                }
             }
         }
     }
@@ -711,12 +713,12 @@ fn generate_random_id(length: usize) -> String {
     let id: String = (0..length)
         .map(|_| {
             let idx = rng.gen_range(0..52);
-            let c = if idx < 26 {
+
+            if idx < 26 {
                 (b'a' + idx as u8) as char
             } else {
                 (b'A' + (idx - 26) as u8) as char
-            };
-            c
+            }
         })
         .collect();
     id
