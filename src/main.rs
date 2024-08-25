@@ -450,8 +450,7 @@ impl Redis {
                     stream.write().await.write_all(b"+OK\r\n").await?;
                 }
                 if command.parts.contains(&String::from("exec")) {
-                    let old = _self.in_transaction.swap(false, Ordering::SeqCst);
-                    if !old {
+                    if !_self.in_transaction.swap(false, Ordering::SeqCst) {
                         stream
                             .write()
                             .await
@@ -460,6 +459,10 @@ impl Redis {
                         continue;
                     }
                     let commands = _self.commands.read().await.clone();
+                    if commands.is_empty() {
+                        stream.write().await.write_all(b"*0\r\n").await?;
+                        continue;
+                    }
                     _self.process_commands(commands, is_master, stream).await?;
                 }
                 if !command.parts.contains(&String::from("config"))
