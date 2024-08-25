@@ -376,6 +376,25 @@ impl Redis {
                         let _set = self.tx.send(message);
                     }
                 }
+                if command.parts.contains(&String::from("incr")) {
+                    let default = String::from("");
+                    let Some(key) = command.parts.get(1) else {
+                        stream.write().await.write_all(":1\r\n".as_bytes()).await?;
+                        continue;
+                    };
+                    let k = key.to_string();
+                    let mut map = self.kv.write().await;
+                    let value = map.get(&k).unwrap_or(&default);
+                    let value = value.parse::<i64>().unwrap_or(0);
+                    let value = value + 1;
+                    map.insert(k, value.to_string());
+                    drop(map);
+                    stream
+                        .write()
+                        .await
+                        .write_all(format!(":{}\r\n", value).as_bytes())
+                        .await?;
+                }
                 if !command.parts.contains(&String::from("config"))
                     && command.parts.contains(&String::from("get"))
                 {
