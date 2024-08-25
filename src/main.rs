@@ -345,23 +345,11 @@ impl Redis {
                     stream.write().await.write_all(response.as_bytes()).await?;
                 }
                 if command.parts.contains(&String::from("ping")) {
-                    if _self.in_transaction.load(Ordering::SeqCst) {
-                        let mut commands = _self.commands.write().await;
-                        commands.push(command);
-                        stream.write().await.write_all(b"+QUEUED\r\n").await?;
-                        continue;
-                    }
                     stream.write().await.write_all(b"+PONG\r\n").await?;
                 }
                 if command.parts.contains(&String::from("echo")) {
                     let default = String::from("");
                     let message = command.parts.get(1).unwrap_or(&default);
-                    if _self.in_transaction.load(Ordering::SeqCst) {
-                        let mut commands = _self.commands.write().await;
-                        commands.push(command);
-                        stream.write().await.write_all(b"+QUEUED\r\n").await?;
-                        continue;
-                    }
                     stream
                         .write()
                         .await
@@ -481,12 +469,6 @@ impl Redis {
                 if !command.parts.contains(&String::from("config"))
                     && command.parts.contains(&String::from("get"))
                 {
-                    if _self.in_transaction.load(Ordering::SeqCst) {
-                        let mut commands = _self.commands.write().await;
-                        commands.push(command);
-                        stream.write().await.write_all(b"+QUEUED\r\n").await?;
-                        continue;
-                    }
                     let Some(key) = command.parts.get(1) else {
                         stream
                             .write()
