@@ -450,7 +450,15 @@ impl Redis {
                     stream.write().await.write_all(b"+OK\r\n").await?;
                 }
                 if command.parts.contains(&String::from("exec")) {
-                    _self.in_transaction.store(false, Ordering::SeqCst);
+                    let old = _self.in_transaction.swap(false, Ordering::SeqCst);
+                    if !old {
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR EXEC without MULTI\r\n")
+                            .await?;
+                        continue;
+                    }
                     let commands = _self.commands.read().await.clone();
                     _self.process_commands(commands, is_master, stream).await?;
                 }
