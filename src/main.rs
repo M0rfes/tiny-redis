@@ -410,6 +410,9 @@ impl Redis {
                         .write_all(format!(":{}\r\n", value).as_bytes())
                         .await?;
                 }
+                if command.parts.contains(&String::from("multi")) {
+                    stream.write().await.write_all(b"+OK\r\n").await?;
+                }
                 if !command.parts.contains(&String::from("config"))
                     && command.parts.contains(&String::from("get"))
                 {
