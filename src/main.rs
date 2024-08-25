@@ -1,9 +1,9 @@
 // Uncomment this block to pass the first stage
 use chrono::Utc;
 use rand::Rng;
-use std::env;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::HashMap, error::Error, str, sync::Arc};
+use std::{env, mem};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{self, Sender};
 use tokio::sync::RwLock;
@@ -458,7 +458,7 @@ impl Redis {
                             .await?;
                         continue;
                     }
-                    let commands = _self.commands.read().await.clone();
+                    let commands: Vec<Command> = mem::take(_self.commands.write().await.as_mut());
                     if commands.is_empty() {
                         stream.write().await.write_all(b"*0\r\n").await?;
                         continue;
