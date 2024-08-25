@@ -469,6 +469,12 @@ impl Redis {
                 if !command.parts.contains(&String::from("config"))
                     && command.parts.contains(&String::from("get"))
                 {
+                    if _self.in_transaction.load(Ordering::SeqCst) {
+                        let mut commands = _self.commands.write().await;
+                        commands.push(command);
+                        stream.write().await.write_all(b"+QUEUED\r\n").await?;
+                        continue;
+                    }
                     let Some(key) = command.parts.get(1) else {
                         stream
                             .write()
