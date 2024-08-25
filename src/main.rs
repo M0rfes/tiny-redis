@@ -13,7 +13,7 @@ use tokio::{
     net::TcpListener,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Command {
     parts: Vec<String>,
     bytes: usize,
@@ -101,6 +101,8 @@ struct Redis {
     offset: Arc<AtomicUsize>,
     write_pending: Arc<AtomicBool>,
     config: Config,
+    in_transaction: Arc<AtomicBool>,
+    commands: ThreadSafe<Vec<Command>>,
 }
 
 unsafe impl Send for Redis {}
@@ -154,6 +156,8 @@ impl Redis {
                 dir,
                 db_filename,
             },
+            in_transaction: Arc::new(AtomicBool::new(false)),
+            commands: Arc::new(RwLock::new(vec![])),
         }
     }
     pub async fn init(self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -306,6 +310,27 @@ impl Redis {
             }
             let commands = String::from_utf8_lossy(&buf[..read_count]).to_command_list()?;
             let is_master = self.master_address.is_none();
+            self.process_commands(commands, is_master, &stream).await?;
+        }
+    }
+
+    async fn process_commands(
+        &mut self,
+        commands: Vec<Command>,
+        is_master: bool,
+        stream: &Arc<RwLock<TcpStream>>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let _ = Box::pin(async move {
+            let _ = inner(self, commands, is_master, stream).await;
+        })
+        .await;
+
+        async fn inner(
+            _self: &mut Redis,
+            commands: Vec<Command>,
+            is_master: bool,
+            stream: &Arc<RwLock<TcpStream>>,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
             for mut command in commands {
                 if command.parts.contains(&String::from("info")) {
                     let role = if is_master { "master" } else { "slave" };
@@ -362,18 +387,23 @@ impl Redis {
                         }
 
                         let ttl = ttl.unwrap() + Utc::now().timestamp_millis();
-                        self.expire.write().await.insert(k.clone(), ttl);
+                        _self.expire.write().await.insert(k.clone(), ttl);
+                    }
+                    if _self.in_transaction.load(Ordering::SeqCst) {
+                        let mut commands = _self.commands.write().await;
+                        commands.push(command);
+                        continue;
                     }
 
-                    let mut map = self.kv.write().await;
+                    let mut map = _self.kv.write().await;
                     map.insert(k, value.to_owned());
                     drop(map);
                     let message = command.parts[..3].join(" ").to_resp_array();
                     stream.write().await.write_all(b"+OK\r\n").await?;
-                    self.offset.fetch_add(command.bytes, Ordering::SeqCst);
-                    if is_master && !self.replicas.read().await.is_empty() {
-                        self.write_pending.store(true, Ordering::SeqCst);
-                        let _set = self.tx.send(message);
+                    _self.offset.fetch_add(command.bytes, Ordering::SeqCst);
+                    if is_master && !_self.replicas.read().await.is_empty() {
+                        _self.write_pending.store(true, Ordering::SeqCst);
+                        let _set = _self.tx.send(message);
                     }
                 }
                 if command.parts.contains(&String::from("incr")) {
@@ -385,8 +415,13 @@ impl Redis {
                             .await?;
                         continue;
                     };
+                    if _self.in_transaction.load(Ordering::SeqCst) {
+                        let mut commands = _self.commands.write().await;
+                        commands.push(command);
+                        continue;
+                    }
                     let k = key.to_string();
-                    let mut map = self.kv.write().await;
+                    let mut map = _self.kv.write().await;
                     let Some(value) = map.get(&k) else {
                         map.insert(k, "1".to_string());
                         drop(map);
@@ -411,7 +446,13 @@ impl Redis {
                         .await?;
                 }
                 if command.parts.contains(&String::from("multi")) {
+                    _self.in_transaction.store(true, Ordering::SeqCst);
                     stream.write().await.write_all(b"+OK\r\n").await?;
+                }
+                if command.parts.contains(&String::from("exec")) {
+                    _self.in_transaction.store(false, Ordering::SeqCst);
+                    let commands = _self.commands.read().await.clone();
+                    _self.process_commands(commands, is_master, stream).await?;
                 }
                 if !command.parts.contains(&String::from("config"))
                     && command.parts.contains(&String::from("get"))
@@ -424,12 +465,12 @@ impl Redis {
                             .await?;
                         continue;
                     };
-                    let map = self.kv.read().await;
+                    let map = _self.kv.read().await;
                     let Some(value) = map.get(key) else {
                         stream.write().await.write_all(b"$-1\r\n").await?;
                         continue;
                     };
-                    let expire = self.expire.read().await;
+                    let expire = _self.expire.read().await;
                     let ttl = expire.get(key).and_then(|&ttl| {
                         if Utc::now().timestamp_millis() >= ttl {
                             Some(())
@@ -442,7 +483,7 @@ impl Redis {
                     drop(map);
                     if ttl.is_some() {
                         stream.write().await.write_all(b"$-1\r\n").await?;
-                        self.kv.write().await.remove(key);
+                        _self.kv.write().await.remove(key);
                         continue;
                     }
 
@@ -499,13 +540,13 @@ impl Redis {
                             .await?;
                         continue;
                     };
-                    let _res = self.wait(stream, min_replica_count, timeout).await;
+                    let _res = _self.wait(stream, min_replica_count, timeout).await;
                 }
                 if command.parts.contains(&String::from("config")) {
                     if command.parts.contains(&String::from("get"))
                         && command.parts.contains(&String::from("dir"))
                     {
-                        let Some(dir_replay) = self.config.dir.clone() else {
+                        let Some(dir_replay) = _self.config.dir.clone() else {
                             stream
                                 .write()
                                 .await
@@ -524,7 +565,7 @@ impl Redis {
                     if command.parts.contains(&String::from("get"))
                         && command.parts.contains(&String::from("dbfilename"))
                     {
-                        let Some(db_filename) = self.config.db_filename.clone() else {
+                        let Some(db_filename) = _self.config.db_filename.clone() else {
                             stream
                                 .write()
                                 .await
@@ -575,11 +616,13 @@ impl Redis {
                         .await
                         .write_all(empty_file_payload.as_slice())
                         .await?;
-                    self.replicas.write().await.push(stream.clone());
+                    _self.replicas.write().await.push(stream.clone());
                     return Ok(());
                 }
             }
+            Ok(())
         }
+        Ok(())
     }
     async fn wait(
         &self,
