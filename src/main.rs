@@ -377,14 +377,22 @@ impl Redis {
                     }
                 }
                 if command.parts.contains(&String::from("incr")) {
-                    let default = String::from("");
                     let Some(key) = command.parts.get(1) else {
-                        stream.write().await.write_all(":1\r\n".as_bytes()).await?;
+                        stream
+                            .write()
+                            .await
+                            .write_all(b"-ERR no key provided\r\n")
+                            .await?;
                         continue;
                     };
                     let k = key.to_string();
                     let mut map = self.kv.write().await;
-                    let value = map.get(&k).unwrap_or(&default);
+                    let Some(value) = map.get(&k) else {
+                        map.insert(k, "1".to_string());
+                        drop(map);
+                        stream.write().await.write_all(b":1\r\n").await?;
+                        continue;
+                    };
                     let value = value.parse::<i64>().unwrap_or(0);
                     let value = value + 1;
                     map.insert(k, value.to_string());
